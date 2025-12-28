@@ -14,4 +14,14 @@ scirs2-stats = "0.1.0-rc.4"
 anyhow = "1.0" # For error handling
 ndarray = "0.17.1"
 scirs2-spatial = "0.1.0-rc.4"
+cedar-elements = { version = "0.1.0", path = "../cedar-server/elements" }
+async-trait = "0.1.89"
+canonical-error = "0.1.0"
+tokio = "1.48.0"
+prost = "0.12.3"
+prost-types = "0.12.3"
+tonic = "0.11"
 
+[build-dependencies]
+prost-build = "0.12.3"
+tonic-build = "0.11"

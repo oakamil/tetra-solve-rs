@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -64,7 +65,7 @@ pub struct Tetra3 {
     pattern_key_hashes: Option<Array1<u16>>,
     star_catalog_ids: Option<Array1<u32>>, 
     db_props: DatabaseProperties,
-    cancelled: bool,
+    cancelled: AtomicBool,
 }
 
 impl Tetra3 {
@@ -95,7 +96,7 @@ impl Tetra3 {
             pattern_key_hashes: None,
             star_catalog_ids: None,
             db_props: default_props,
-            cancelled: false,
+            cancelled: AtomicBool::new(false),
         };
 
         if let Some(path) = load_database {
@@ -163,7 +164,7 @@ impl Tetra3 {
         Ok(())
     }
 
-pub fn solve_from_centroids(
+    pub fn solve_from_centroids(
         &mut self,
         star_centroids: &Array2<f64>,
         size: (u32, u32),
@@ -275,8 +276,7 @@ pub fn solve_from_centroids(
                     };
                 }
             }
-            if self.cancelled {
-                 self.cancelled = false;
+            if self.cancelled.swap(false, Ordering::SeqCst) {
                  return SolveResult { 
                     ra: None, dec: None, roll: None, fov: None, distortion: None, 
                     rmse: None, matches: None, prob: None, t_solve: t0.elapsed().as_secs_f64()*1000.0, 
@@ -534,6 +534,10 @@ pub fn solve_from_centroids(
             rmse: None, matches: None, prob: None, t_solve: t0.elapsed().as_secs_f64() * 1000.0,
             status: NO_MATCH,
         }
+    }
+
+    pub fn set_cancelled(&mut self, cancelled: bool) {
+        self.cancelled.store(cancelled, Ordering::SeqCst);
     }
 
     fn get_all_patterns_for_index(
