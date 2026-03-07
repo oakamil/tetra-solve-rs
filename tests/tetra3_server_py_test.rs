@@ -21,7 +21,7 @@ use tetra3_server::tetra3_solver::Tetra3Solver;
 
 #[tokio::test]
 async fn test_python_solver_consistency_with_testdata() {
-    let db_path = Path::new("test/default_database.npz");
+    let db_path = Path::new("data/default_database.npz");
     if !db_path.exists() {
         eprintln!("Skipping test: default_database.npz not found.");
         return;
@@ -48,7 +48,7 @@ async fn test_python_solver_consistency_with_testdata() {
     .await
     .expect("Failed to start and connect to the Tetra3 Python server");
 
-    let zip_path = Path::new("test/testdata.zip");
+    let zip_path = Path::new("data/testdata.zip");
     let zip_file = File::open(zip_path).expect(
         "Failed to open test/testdata.zip. Ensure the file exists.",
     );
