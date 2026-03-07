@@ -22,14 +22,7 @@ use cedar_elements::{
 };
 use ndarray::Array2;
 
-use crate::tetra3::Tetra3;
-
-// Status constants matching Tetra3 implementation
-const MATCH_FOUND: u8 = 1;
-const NO_MATCH: u8 = 2;
-const TIMEOUT: u8 = 3;
-const CANCELLED: u8 = 4;
-const TOO_FEW: u8 = 5;
+use crate::tetra3::{SolveOptions, SolveStatus, Tetra3};
 
 pub struct Tetra3Solver {
     inner: tokio::sync::Mutex<Tetra3>,
@@ -70,29 +63,54 @@ impl SolverTrait for Tetra3Solver {
             centroids_arr[[i, 1]] = coord.x;
         }
 
-        // Map SolveParams to Tetra3 arguments
-        let fov_estimate = params.fov_estimate.map(|(fov, _)| fov);
-        let fov_max_error = params.fov_estimate.map(|(_, err)| err);
-        let solve_timeout_ms =
-            params.solve_timeout.map(|d| d.as_millis() as u64);
+        // Fetch Tetra3 defaults to use as fallbacks for optional parameters
+        let default_options = SolveOptions::default();
 
-        // Synchronize trait cancellation flag with the Tetra3 instance
-        // (Note: This assumes Tetra3 has been updated to check this flag)
-        inner.set_cancelled(false);
+        // Map SolveParams and SolveExtension to Tetra3 SolveOptions
+        let mut options = SolveOptions {
+            fov_estimate: params.fov_estimate.map(|(fov, _)| fov),
+            fov_max_error: params.fov_estimate.map(|(_, err)| err),
+            match_radius: params.match_radius.unwrap_or(default_options.match_radius),
+            match_threshold: params.match_threshold.unwrap_or(default_options.match_threshold),
+            solve_timeout_ms: params.solve_timeout.map(|d| d.as_millis() as f64),
+            distortion: params.distortion,
+            match_max_error: params.match_max_error.unwrap_or(default_options.match_max_error),
+            ..default_options
+        };
+
+        // Pass target pixels if requested via extension
+        if let Some(tp) = &extension.target_pixel {
+            let mut target_px_arr = Array2::zeros((tp.len(), 2));
+            for (i, coord) in tp.iter().enumerate() {
+                target_px_arr[[i, 0]] = coord.y;
+                target_px_arr[[i, 1]] = coord.x;
+            }
+            options.target_pixel = Some(target_px_arr);
+        }
+
+        // Pass target sky coordinates if requested via extension
+        if let Some(tsc) = &extension.target_sky_coord {
+            let mut target_sky_arr = Array2::zeros((tsc.len(), 2));
+            for (i, coord) in tsc.iter().enumerate() {
+                target_sky_arr[[i, 0]] = coord.ra;
+                target_sky_arr[[i, 1]] = coord.dec;
+            }
+            options.target_sky_coord = Some(target_sky_arr);
+        }
+
+        // Check if the overall task was cancelled prior to the lock acquisition
+        if self.cancelled.load(AtomicOrdering::SeqCst) {
+            return Err(deadline_exceeded_error("Solve operation was cancelled."));
+        }
 
         let result = inner.solve_from_centroids(
             &centroids_arr,
-            (height as u32, width as u32),
-            fov_estimate,
-            fov_max_error,
-            params.match_radius,
-            params.match_threshold,
-            solve_timeout_ms,
-            params.distortion,
+            (height as f64, width as f64),
+            options,
         );
 
         match result.status {
-            MATCH_FOUND => {
+            SolveStatus::MatchFound => {
                 let mut plate_solution = PlateSolution::default();
 
                 // Populate core coordinates
@@ -111,28 +129,19 @@ impl SolverTrait for Tetra3Solver {
 
                 // Populate timing information (convert ms to proto Duration)
                 plate_solution.solve_time = Some(prost_types::Duration {
-                    seconds: (result.t_solve / 1000.0) as i64,
-                    nanos: ((result.t_solve % 1000.0) * 1_000_000.0) as i32,
+                    seconds: (result.t_solve_ms / 1000.0) as i64,
+                    nanos: ((result.t_solve_ms % 1000.0) * 1_000_000.0) as i32,
                 });
-
-                // Note: rotation_matrix, target_pixel, and target_sky_coord are
-                // omitted here as the provided SolveResult does
-                // not include the raw rotation matrix,
-                // and coordinate transforms are typically handled by Cedar's
-                // astro_util.rs.
 
                 Ok(plate_solution)
             }
-            NO_MATCH => Err(not_found_error("Solver failed to find a match.")),
-            TIMEOUT => Err(deadline_exceeded_error("Solver timed out.")),
-            CANCELLED => {
+            SolveStatus::NoMatch => Err(not_found_error("Solver failed to find a match.")),
+            SolveStatus::Timeout => Err(deadline_exceeded_error("Solver timed out.")),
+            SolveStatus::Cancelled => {
                 Err(deadline_exceeded_error("Solve operation was cancelled."))
             }
-            TOO_FEW => Err(invalid_argument_error(
+            SolveStatus::TooFew => Err(invalid_argument_error(
                 "Too few centroids to attempt solve.",
-            )),
-            _ => Err(not_found_error(
-                "Solver encountered an unknown error state.",
             )),
         }
     }
@@ -141,10 +150,9 @@ impl SolverTrait for Tetra3Solver {
         // Atomically set the flag to signal the solver loop to terminate
         self.cancelled.store(true, AtomicOrdering::SeqCst);
 
-        // Attempt to set the flag on the inner instance if the lock is
-        // available
+        // Attempt to set the flag on the inner instance if the lock is available
         if let Ok(mut inner) = self.inner.try_lock() {
-            inner.set_cancelled(true);
+            inner.cancel_solve();
         }
     }
 
@@ -160,39 +168,31 @@ mod tests {
         fs::File,
         io::{Cursor, Read},
         path::Path,
+        time::Instant, // Import Instant for timing
     };
 
-    use prost::Message; /* Ensure 'prost' is in your Cargo.toml
-                          * dependencies */
+    use prost::Message;
     use zip::ZipArchive;
 
     use super::*;
-    // Import the necessary structs from your crate
-    // Adjust 'crate::tetra3' and 'crate::tetra3_server' to match your
-    // project structure
     use crate::tetra3::Tetra3;
     use crate::{
-        tetra3_server::{SolveRequest, SolveResult, SolveStatus},
+        tetra3_server::{SolveRequest, SolveResult, SolveStatus as ProtoSolveStatus},
         tetra3_solver::Tetra3Solver,
     };
 
     #[tokio::test]
     async fn test_solver_consistency_with_testdata() {
-        // 1. Initialize the Tetra3Solver
-        // We assume the default database is available in the root directory.
-        // Update this path if your database is located elsewhere (e.g.,
-        // "data/default_database.npz").
         let db_path = Path::new("test/default_database.npz");
         if !db_path.exists() {
             eprintln!("Skipping test: default_database.npz not found.");
             return;
         }
         let solver = Tetra3Solver::new(
-            Tetra3::new(db_path.to_str())
+            Tetra3::load_database(db_path)
                 .expect("Failed to load Tetra3 database"),
         );
 
-        // 2. Open the testdata.zip file
         let zip_path = Path::new("test/testdata.zip");
         let zip_file = File::open(zip_path).expect(
             "Failed to open test/testdata.zip. Ensure the file exists.",
@@ -200,9 +200,10 @@ mod tests {
         let mut archive =
             ZipArchive::new(zip_file).expect("Failed to open zip archive");
 
-        // 3. Iterate from x = 0 to 737
+        // We will collect errors here instead of panicking immediately
+        let mut all_failures = Vec::new();
+
         for x in 0..=737 {
-            // --- Parse SolveRequest ---
             let req_filename = format!("solve_request_{}.pb", x);
             let mut req_buffer = Vec::new();
 
@@ -217,7 +218,6 @@ mod tests {
             let request = SolveRequest::decode(Cursor::new(req_buffer))
                 .expect("Failed to decode SolveRequest proto");
 
-            // --- Parse SolveResult (Expected) ---
             let res_filename = format!("solve_result_{}.pb", x);
             let mut res_file =
                 archive.by_name(&res_filename).unwrap_or_else(|_| {
@@ -229,12 +229,6 @@ mod tests {
 
             let expected_result = SolveResult::decode(Cursor::new(res_buffer))
                 .expect("Failed to decode SolveResult proto");
-
-            // --- Invoke solve_from_centroids ---
-            // We extract the relevant fields from the request to pass to the
-            // solver. Note: If your solve_from_centroids accepts
-            // the 'SolveRequest' struct directly, you can pass
-            // 'request' instead of extracting individual fields.
 
             let centroids: Vec<ImageCoord> = request
                 .star_centroids
@@ -258,6 +252,7 @@ mod tests {
                 })
                 .collect();
             extension.target_pixel = Some(target_pixels);
+            
             let target_sky_coords: Vec<CelestialCoord> = request
                 .target_sky_coords
                 .iter()
@@ -279,71 +274,83 @@ mod tests {
             params.distortion = request.distortion;
             params.match_max_error = request.match_max_error;
 
+            // --- Capture the execution time ---
+            let start_time = Instant::now();
+            
             let res = solver
                 .solve_from_centroids(
                     &centroids, width, height, &extension, &params, None,
                 )
                 .await;
+            
+            let solve_duration = start_time.elapsed();
+            // -----------------------------------
 
             match res {
                 Ok(ref _s) => {}
                 Err(e) => {
-                    if expected_result.status
-                        == Some(SolveStatus::MatchFound as i32)
-                    {
-                        panic!("Expected a valid solution for iteration {} but found error: {:?}", x, e);
+                    if expected_result.status == Some(ProtoSolveStatus::MatchFound as i32) {
+                        all_failures.push(format!("Sample {}: Expected MatchFound but got error {:?}", x, e));
                     }
                     continue;
                 }
             };
             let result = res.unwrap();
 
-            // We verify RA, Dec, Roll, and FOV are within a reasonable
-            // tolerance.
-            if expected_result.status == Some(SolveStatus::MatchFound as i32) {
-                let epsilon = 1e-5; // Tolerance for floating point comparison
-                let expected_coords =
-                    expected_result.image_center_coords.unwrap();
+            if expected_result.status == Some(ProtoSolveStatus::MatchFound as i32) {
+                let epsilon = 1e-5; 
+                let expected_coords = expected_result.image_center_coords.unwrap();
                 let expected_ra = expected_coords.ra;
                 let expected_dec = expected_coords.dec;
                 let expected_roll = expected_result.roll.unwrap();
-                let expected_fov = expected_result.roll.unwrap();
+                let expected_fov = expected_result.fov.unwrap(); 
+                
                 let result_coord = result.image_sky_coord.unwrap();
                 let result_ra = result_coord.ra;
                 let result_dec = result_coord.dec;
 
-                assert!(
-                    (result_ra - expected_ra).abs() < epsilon,
-                    "RA mismatch at sample {}: expected {}, got {}",
-                    x,
-                    expected_ra,
-                    result_ra
-                );
+                println!("--- Sample {} ---", x);
+                println!("Solve time : {:.2?}", solve_duration);
+                println!("Expected   : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}", 
+                         expected_ra, expected_dec, expected_roll, expected_fov);
+                println!("Actual     : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}", 
+                         result_ra, result_dec, result.roll, result.fov);
+                println!("Diff       : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}", 
+                         (result_ra - expected_ra).abs(), 
+                         (result_dec - expected_dec).abs(), 
+                         (result.roll - expected_roll).abs(), 
+                         (result.fov - expected_fov).abs());
+                println!("-------------------\n");
 
-                assert!(
-                    (result_dec - expected_dec).abs() < epsilon,
-                    "Dec mismatch at sample {}: expected {}, got {}",
-                    x,
-                    expected_dec,
-                    result_dec
-                );
+                // Instead of assert!, we push errors to our collection
+                let mut sample_errors = Vec::new();
 
-                assert!(
-                    (result.roll - expected_roll).abs() < epsilon,
-                    "Roll mismatch at sample {}: expected {}, got {}",
-                    x,
-                    expected_roll,
-                    result.roll
-                );
+                if (result_ra - expected_ra).abs() >= epsilon {
+                    sample_errors.push(format!("RA mismatch: expected {}, got {}", expected_ra, result_ra));
+                }
+                if (result_dec - expected_dec).abs() >= epsilon {
+                    sample_errors.push(format!("Dec mismatch: expected {}, got {}", expected_dec, result_dec));
+                }
+                if (result.roll - expected_roll).abs() >= epsilon {
+                    sample_errors.push(format!("Roll mismatch: expected {}, got {}", expected_roll, result.roll));
+                }
+                if (result.fov - expected_fov).abs() >= epsilon {
+                    sample_errors.push(format!("FOV mismatch: expected {}, got {}", expected_fov, result.fov));
+                }
 
-                assert!(
-                    (result.fov - expected_fov).abs() < epsilon,
-                    "FOV mismatch at sample {}: expected {}, got {}",
-                    x,
-                    expected_fov,
-                    result.fov
-                );
+                if !sample_errors.is_empty() {
+                    all_failures.push(format!("Sample {} failures:\n  {}", x, sample_errors.join("\n  ")));
+                }
             }
+        }
+
+        // Finally, panic if there were any failures accumulated across ALL 738 iterations.
+        if !all_failures.is_empty() {
+            panic!(
+                "{} of 738 test samples failed:\n\n{}",
+                all_failures.len(),
+                all_failures.join("\n\n")
+            );
         }
     }
 }
