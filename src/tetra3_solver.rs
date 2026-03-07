@@ -202,8 +202,10 @@ mod tests {
 
         // We will collect errors here instead of panicking immediately
         let mut all_failures = Vec::new();
+        let mut total_solve_micros = 0;
+        let iterations = 738;
 
-        for x in 0..=737 {
+        for x in 0..=iterations-1 {
             let req_filename = format!("solve_request_{}.pb", x);
             let mut req_buffer = Vec::new();
 
@@ -284,6 +286,7 @@ mod tests {
                 .await;
             
             let solve_duration = start_time.elapsed();
+            total_solve_micros += solve_duration.as_micros();
             // -----------------------------------
 
             match res {
@@ -343,6 +346,18 @@ mod tests {
                 }
             }
         }
+
+        println!(
+            "\n=== Performance Report ===\n\
+             Total iterations: {}\n\
+             Successful matches: {}\n\
+             Pure solver time: {:.2} ms\n\
+             Average time per solve: {:.2} ms\n",
+            iterations,
+            iterations - all_failures.len(),
+            total_solve_micros as f64 / 1000.0,
+            total_solve_micros as f64 / 1000.0 / (iterations as f64),
+        );
 
         // Finally, panic if there were any failures accumulated across ALL 738 iterations.
         if !all_failures.is_empty() {

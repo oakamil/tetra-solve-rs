@@ -55,8 +55,10 @@ async fn test_python_solver_consistency_with_testdata() {
     let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
 
     let mut all_failures = Vec::new();
+    let mut total_solve_micros = 0;
+    let iterations = 738;
 
-    for x in 0..=737 {
+    for x in 0..=iterations-1 {
         let req_filename = format!("solve_request_{}.pb", x);
         let mut req_buffer = Vec::new();
 
@@ -133,6 +135,7 @@ async fn test_python_solver_consistency_with_testdata() {
             .await;
 
         let solve_duration = start_time.elapsed();
+        total_solve_micros += solve_duration.as_micros();
 
         match res {
             Ok(ref _s) => {}
@@ -215,6 +218,18 @@ async fn test_python_solver_consistency_with_testdata() {
             }
         }
     }
+
+    println!(
+        "\n=== Performance Report ===\n\
+         Total iterations: {}\n\
+         Successful matches: {}\n\
+         Pure solver time: {:.2} ms\n\
+         Average time per solve: {:.2} ms\n",
+        iterations,
+        iterations - all_failures.len(),
+        total_solve_micros as f64 / 1000.0,
+        total_solve_micros as f64 / 1000.0 / (iterations as f64),
+    );
 
     if !all_failures.is_empty() {
         panic!(
