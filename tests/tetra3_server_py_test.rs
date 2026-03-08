@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::{Cursor, Read},
     path::Path,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
@@ -31,14 +31,17 @@ async fn test_python_solver_consistency_with_testdata() {
 
     let script_path = Path::new("../tetra3_server/python/tetra3_server.py");
     if !script_path.exists() {
-        eprintln!("Skipping test: Python server script not found at {:?}", script_path);
+        eprintln!(
+            "Skipping test: Python server script not found at {:?}",
+            script_path
+        );
         return;
     }
     // Convert to absolute path just to be safe
     let abs_script_path = std::fs::canonicalize(script_path).unwrap();
 
     let got_signal = Arc::new(AtomicBool::new(false));
-    
+
     // Initialize the Python gRPC Subprocess via Tetra3Solver
     let solver = Tetra3Solver::new(
         abs_script_path.to_str().unwrap(),
@@ -49,23 +52,22 @@ async fn test_python_solver_consistency_with_testdata() {
     .expect("Failed to start and connect to the Tetra3 Python server");
 
     let zip_path = Path::new("data/testdata.zip");
-    let zip_file = File::open(zip_path).expect(
-        "Failed to open test/testdata.zip. Ensure the file exists.",
-    );
+    let zip_file =
+        File::open(zip_path).expect("Failed to open test/testdata.zip. Ensure the file exists.");
     let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
 
     let mut all_failures = Vec::new();
     let mut total_solve_micros = 0;
     let iterations = 738;
 
-    for x in 0..=iterations-1 {
+    for x in 0..=iterations - 1 {
         let req_filename = format!("solve_request_{}.pb", x);
         let mut req_buffer = Vec::new();
 
         {
-            let mut req_file = archive.by_name(&req_filename).unwrap_or_else(|_| {
-                panic!("Entry {} not found in zip", req_filename)
-            });
+            let mut req_file = archive
+                .by_name(&req_filename)
+                .unwrap_or_else(|_| panic!("Entry {} not found in zip", req_filename));
             req_file.read_to_end(&mut req_buffer).unwrap();
         }
 
@@ -73,9 +75,9 @@ async fn test_python_solver_consistency_with_testdata() {
             .expect("Failed to decode SolveRequest proto");
 
         let res_filename = format!("solve_result_{}.pb", x);
-        let mut res_file = archive.by_name(&res_filename).unwrap_or_else(|_| {
-            panic!("Entry {} not found in zip", res_filename)
-        });
+        let mut res_file = archive
+            .by_name(&res_filename)
+            .unwrap_or_else(|_| panic!("Entry {} not found in zip", res_filename));
 
         let mut res_buffer = Vec::new();
         res_file.read_to_end(&mut res_buffer).unwrap();

@@ -3,16 +3,15 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
         Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use canonical_error::{
-    deadline_exceeded_error, invalid_argument_error, not_found_error,
-    CanonicalError,
+    CanonicalError, deadline_exceeded_error, invalid_argument_error, not_found_error,
 };
 use cedar_elements::{
     cedar::{ImageCoord, PlateSolution},
@@ -71,10 +70,14 @@ impl SolverTrait for Tetra3Solver {
             fov_estimate: params.fov_estimate.map(|(fov, _)| fov),
             fov_max_error: params.fov_estimate.map(|(_, err)| err),
             match_radius: params.match_radius.unwrap_or(default_options.match_radius),
-            match_threshold: params.match_threshold.unwrap_or(default_options.match_threshold),
+            match_threshold: params
+                .match_threshold
+                .unwrap_or(default_options.match_threshold),
             solve_timeout_ms: params.solve_timeout.map(|d| d.as_millis() as f64),
             distortion: params.distortion,
-            match_max_error: params.match_max_error.unwrap_or(default_options.match_max_error),
+            match_max_error: params
+                .match_max_error
+                .unwrap_or(default_options.match_max_error),
             ..default_options
         };
 
@@ -103,11 +106,8 @@ impl SolverTrait for Tetra3Solver {
             return Err(deadline_exceeded_error("Solve operation was cancelled."));
         }
 
-        let result = inner.solve_from_centroids(
-            &centroids_arr,
-            (height as f64, width as f64),
-            options,
-        );
+        let result =
+            inner.solve_from_centroids(&centroids_arr, (height as f64, width as f64), options);
 
         match result.status {
             SolveStatus::MatchFound => {
@@ -189,31 +189,27 @@ mod tests {
             return;
         }
         let solver = Tetra3Solver::new(
-            Tetra3::load_database(db_path)
-                .expect("Failed to load Tetra3 database"),
+            Tetra3::load_database(db_path).expect("Failed to load Tetra3 database"),
         );
 
         let zip_path = Path::new("data/testdata.zip");
-        let zip_file = File::open(zip_path).expect(
-            "Failed to open test/testdata.zip. Ensure the file exists.",
-        );
-        let mut archive =
-            ZipArchive::new(zip_file).expect("Failed to open zip archive");
+        let zip_file = File::open(zip_path)
+            .expect("Failed to open test/testdata.zip. Ensure the file exists.");
+        let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
 
         // We will collect errors here instead of panicking immediately
         let mut all_failures = Vec::new();
         let mut total_solve_micros = 0;
         let iterations = 738;
 
-        for x in 0..=iterations-1 {
+        for x in 0..=iterations - 1 {
             let req_filename = format!("solve_request_{}.pb", x);
             let mut req_buffer = Vec::new();
 
             {
-                let mut req_file =
-                    archive.by_name(&req_filename).unwrap_or_else(|_| {
-                        panic!("Entry {} not found in zip", req_filename)
-                    });
+                let mut req_file = archive
+                    .by_name(&req_filename)
+                    .unwrap_or_else(|_| panic!("Entry {} not found in zip", req_filename));
                 req_file.read_to_end(&mut req_buffer).unwrap();
             }
 
@@ -221,10 +217,9 @@ mod tests {
                 .expect("Failed to decode SolveRequest proto");
 
             let res_filename = format!("solve_result_{}.pb", x);
-            let mut res_file =
-                archive.by_name(&res_filename).unwrap_or_else(|_| {
-                    panic!("Entry {} not found in zip", res_filename)
-                });
+            let mut res_file = archive
+                .by_name(&res_filename)
+                .unwrap_or_else(|_| panic!("Entry {} not found in zip", res_filename));
 
             let mut res_buffer = Vec::new();
             res_file.read_to_end(&mut res_buffer).unwrap();
@@ -254,7 +249,7 @@ mod tests {
                 })
                 .collect();
             extension.target_pixel = Some(target_pixels);
-            
+
             let target_sky_coords: Vec<CelestialCoord> = request
                 .target_sky_coords
                 .iter()
@@ -278,13 +273,11 @@ mod tests {
 
             // --- Capture the execution time ---
             let start_time = Instant::now();
-            
+
             let res = solver
-                .solve_from_centroids(
-                    &centroids, width, height, &extension, &params, None,
-                )
+                .solve_from_centroids(&centroids, width, height, &extension, &params, None)
                 .await;
-            
+
             let solve_duration = start_time.elapsed();
             total_solve_micros += solve_duration.as_micros();
             // -----------------------------------
@@ -293,7 +286,10 @@ mod tests {
                 Ok(ref _s) => {}
                 Err(e) => {
                     if expected_result.status == Some(ProtoSolveStatus::MatchFound as i32) {
-                        all_failures.push(format!("Sample {}: Expected MatchFound but got error {:?}", x, e));
+                        all_failures.push(format!(
+                            "Sample {}: Expected MatchFound but got error {:?}",
+                            x, e
+                        ));
                     }
                     continue;
                 }
@@ -301,48 +297,70 @@ mod tests {
             let result = res.unwrap();
 
             if expected_result.status == Some(ProtoSolveStatus::MatchFound as i32) {
-                let epsilon = 1e-5; 
+                let epsilon = 1e-5;
                 let expected_coords = expected_result.image_center_coords.unwrap();
                 let expected_ra = expected_coords.ra;
                 let expected_dec = expected_coords.dec;
                 let expected_roll = expected_result.roll.unwrap();
-                let expected_fov = expected_result.fov.unwrap(); 
-                
+                let expected_fov = expected_result.fov.unwrap();
+
                 let result_coord = result.image_sky_coord.unwrap();
                 let result_ra = result_coord.ra;
                 let result_dec = result_coord.dec;
 
                 println!("--- Sample {} ---", x);
                 println!("Solve time : {:.2?}", solve_duration);
-                println!("Expected   : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}", 
-                         expected_ra, expected_dec, expected_roll, expected_fov);
-                println!("Actual     : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}", 
-                         result_ra, result_dec, result.roll, result.fov);
-                println!("Diff       : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}", 
-                         (result_ra - expected_ra).abs(), 
-                         (result_dec - expected_dec).abs(), 
-                         (result.roll - expected_roll).abs(), 
-                         (result.fov - expected_fov).abs());
+                println!(
+                    "Expected   : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}",
+                    expected_ra, expected_dec, expected_roll, expected_fov
+                );
+                println!(
+                    "Actual     : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}",
+                    result_ra, result_dec, result.roll, result.fov
+                );
+                println!(
+                    "Diff       : RA: {:.6}, Dec: {:.6}, Roll: {:.6}, FOV: {:.6}",
+                    (result_ra - expected_ra).abs(),
+                    (result_dec - expected_dec).abs(),
+                    (result.roll - expected_roll).abs(),
+                    (result.fov - expected_fov).abs()
+                );
                 println!("-------------------\n");
 
                 // Instead of assert!, we push errors to our collection
                 let mut sample_errors = Vec::new();
 
                 if (result_ra - expected_ra).abs() >= epsilon {
-                    sample_errors.push(format!("RA mismatch: expected {}, got {}", expected_ra, result_ra));
+                    sample_errors.push(format!(
+                        "RA mismatch: expected {}, got {}",
+                        expected_ra, result_ra
+                    ));
                 }
                 if (result_dec - expected_dec).abs() >= epsilon {
-                    sample_errors.push(format!("Dec mismatch: expected {}, got {}", expected_dec, result_dec));
+                    sample_errors.push(format!(
+                        "Dec mismatch: expected {}, got {}",
+                        expected_dec, result_dec
+                    ));
                 }
                 if (result.roll - expected_roll).abs() >= epsilon {
-                    sample_errors.push(format!("Roll mismatch: expected {}, got {}", expected_roll, result.roll));
+                    sample_errors.push(format!(
+                        "Roll mismatch: expected {}, got {}",
+                        expected_roll, result.roll
+                    ));
                 }
                 if (result.fov - expected_fov).abs() >= epsilon {
-                    sample_errors.push(format!("FOV mismatch: expected {}, got {}", expected_fov, result.fov));
+                    sample_errors.push(format!(
+                        "FOV mismatch: expected {}, got {}",
+                        expected_fov, result.fov
+                    ));
                 }
 
                 if !sample_errors.is_empty() {
-                    all_failures.push(format!("Sample {} failures:\n  {}", x, sample_errors.join("\n  ")));
+                    all_failures.push(format!(
+                        "Sample {} failures:\n  {}",
+                        x,
+                        sample_errors.join("\n  ")
+                    ));
                 }
             }
         }
