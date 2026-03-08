@@ -431,7 +431,7 @@ impl Tetra3 {
             star_kd_tree.add(&point, i as u64);
         }
 
-        let num_patterns = pattern_catalog.nrows() / 2;
+        let mut num_patterns = pattern_catalog.nrows() / 2;
 
         let mut db_props = HashMap::new();
         let mut linear_probe = false; 
@@ -487,8 +487,11 @@ impl Tetra3 {
                         let vs = u16::from_le_bytes([data[800], data[801]]);
                         db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
                         
-                        let presort = data[824] != 0;
+                        let presort = data[823] != 0;
                         db_props.insert("presort_patterns".to_string(), if presort { 1.0 } else { 0.0 });
+
+                        let extracted_num_patterns = u32::from_le_bytes([data[824], data[825], data[826], data[827]]);
+                        num_patterns = extracted_num_patterns as usize;
                     }
                 }
             }
