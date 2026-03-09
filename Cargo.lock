@@ -415,24 +415,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "cedar-solve-rs"
+name = "cedar-solver"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "canonical-error",
  "cedar-elements",
- "itertools 0.11.0",
- "kiddo",
- "nalgebra 0.34.1",
  "ndarray",
- "npyz",
  "prost",
  "prost-build",
  "prost-types",
- "statrs",
+ "tetra3",
  "tetra3_server",
  "tokio",
- "tonic",
  "tonic-build",
  "zip",
 ]
@@ -2749,6 +2744,20 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tetra3"
+version = "0.1.0"
+dependencies = [
+ "itertools 0.11.0",
+ "kiddo",
+ "nalgebra 0.34.1",
+ "ndarray",
+ "npyz",
+ "statrs",
+ "tonic-build",
+ "zip",
 ]
 
 [[package]]

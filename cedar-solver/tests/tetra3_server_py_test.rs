@@ -32,7 +32,7 @@ async fn test_python_solver_consistency_with_testdata() {
     // Convert to absolute path so Python's tetra3 doesn't prepend its own data directory
     let abs_db_path = std::fs::canonicalize(db_path).unwrap();
 
-    let script_path = Path::new("../tetra3_server/python/tetra3_server.py");
+    let script_path = Path::new("../../tetra3_server/python/tetra3_server.py");
     if !script_path.exists() {
         eprintln!(
             "Skipping test: Python server script not found at {:?}",

@@ -1,31 +1,9 @@
-[package]
-name = "tetra-solve-rs"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-zip = "0.6"
-itertools = "0.11"
-ndarray = "0.17.1"
-cedar-elements = { version = "0.1.0", path = "../cedar-server/elements" }
-async-trait = "0.1.89"
-canonical-error = "0.1.0"
-tokio = "1.48.0"
-prost = "0.12.3"
-prost-types = "0.12.3"
-tonic = "0.11"
-npyz = "0.8"
-statrs = "0.16"
-kiddo = "3.0"
-nalgebra = "0.34.1"
-
-[build-dependencies]
-prost-build = "0.12.3"
-tonic-build = "0.11"
-
-[dev-dependencies]
-tetra3_server = { path = "../tetra3_server" }
-tokio = { version = "1.0", features = ["full", "test-util"] }
+[workspace]
+members = [
+    "tetra3",
+    "cedar-solver"
+]
+resolver = "2"
 
 [profile.release]
 lto = "fat"            # Enables Link-Time Optimization across all dependency crates

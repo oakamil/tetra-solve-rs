@@ -21,7 +21,7 @@ use cedar_elements::{
 };
 use ndarray::Array2;
 
-use crate::tetra3::{SolveOptions, SolveStatus, Tetra3};
+use tetra3::{SolveOptions, SolveStatus, Tetra3};
 
 pub struct Tetra3Solver {
     inner: tokio::sync::Mutex<Tetra3>,
@@ -175,11 +175,12 @@ mod tests {
     use zip::ZipArchive;
 
     use super::*;
-    use crate::tetra3::Tetra3;
-    use crate::{
-        tetra3_server::{SolveRequest, SolveResult, SolveStatus as ProtoSolveStatus},
-        tetra3_solver::Tetra3Solver,
+    use tetra3::Tetra3;
+    use tetra3_server::tetra3_server::{
+        SolveRequest, SolveResult, SolveStatus as ProtoSolveStatus,
     };
+
+    use crate::tetra3_solver::Tetra3Solver;
 
     #[tokio::test]
     async fn test_solver_consistency_with_testdata() {
