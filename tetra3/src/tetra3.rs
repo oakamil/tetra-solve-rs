@@ -829,6 +829,22 @@ impl Tetra3 {
             let mut image_pattern_largest_distance = None;
 
             for (_, pattern_key) in pattern_key_list {
+                if let Some(timeout) = options.solve_timeout_ms {
+                    if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
+                        return Solution {
+                            status: SolveStatus::Timeout,
+                            ..Default::default()
+                        };
+                    }
+                }
+                if self.cancelled {
+                    self.cancelled = false;
+                    return Solution {
+                        status: SolveStatus::Cancelled,
+                        ..Default::default()
+                    };
+                }
+
                 let pattern_key_hash = self.compute_pattern_key_hash(&pattern_key, p_bins);
                 let hash_index = self.pattern_key_hash_to_index(
                     pattern_key_hash,
@@ -844,6 +860,22 @@ impl Tetra3 {
                 );
 
                 for (idx, cat_edges) in cat_edges_list.iter().enumerate() {
+                    if let Some(timeout) = options.solve_timeout_ms {
+                        if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
+                            return Solution {
+                                status: SolveStatus::Timeout,
+                                ..Default::default()
+                            };
+                        }
+                    }
+                    if self.cancelled {
+                        self.cancelled = false;
+                        return Solution {
+                            status: SolveStatus::Cancelled,
+                            ..Default::default()
+                        };
+                    }
+
                     let catalog_largest_edge = *cat_edges.last().unwrap();
                     let mut valid = true;
                     for i in 0..(cat_edges.len() - 1) {
