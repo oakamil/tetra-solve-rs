@@ -110,7 +110,7 @@ fn distance_from_angle(angle: f64) -> f64 {
 }
 
 // OPTIMIZATION: Replaces incredibly heavy `statrs::Binomial` cdf calculation inside hot loops.
-// Nanosecond execution time for small N.
+// Nanosecond execution time for small N probabilities, exactly mirroring scipy.stats.binom.cdf.
 fn fast_binomial_cdf(k: i64, n: u64, p: f64) -> f64 {
     if k < 0 { return 0.0; }
     if k >= n as i64 { return 1.0; }
@@ -143,7 +143,7 @@ fn compute_vectors_flat(centroids: &[[f64; 2]], height: f64, width: f64, fov: f6
     out
 }
 
-// Zero-allocation inner loop alternative
+// OPTIMIZATION: Zero-allocation inner loop alternative for compute_vectors
 fn compute_vectors_inplace(
     centroids: &[[f64; 2]],
     height: f64,
@@ -165,7 +165,7 @@ fn compute_vectors_inplace(
     }
 }
 
-// Zero-allocation inner loop alternative
+// OPTIMIZATION: Zero-allocation inner loop alternative for compute_centroids
 fn compute_centroids_inplace(
     vectors: &[[f64; 3]],
     height: f64,
@@ -240,7 +240,7 @@ fn distort_centroids(
     distorted
 }
 
-// Zero-allocation inner loop alternative
+// OPTIMIZATION: Zero-allocation inner loop alternative for sort_vectors_by_radius
 fn sort_vectors_by_radius_inplace(
     vectors: &[[f64; 3]],
     sorted_out: &mut [[f64; 3]],
@@ -272,7 +272,7 @@ fn sort_vectors_by_radius_inplace(
     }
 }
 
-// Fully unrolled, pure-Rust rotation helper (Zero-allocation inplace)
+// OPTIMIZATION: Fully unrolled, zero-allocation rotation helper.
 fn rotate_vectors_inplace(
     rot: &Matrix3<f64>,
     vecs: &[[f64; 3]],
@@ -288,7 +288,7 @@ fn rotate_vectors_inplace(
     }
 }
 
-// Pure-Rust stack-allocated SVD (via nalgebra).
+// OPTIMIZATION: Pure-Rust stack-allocated SVD (via nalgebra). Replaces dynamic DMatrix matching.
 fn find_rotation_matrix_and_det_inplace(
     image_vectors: &[[f64; 3]],
     catalog_vectors: &[[f64; 3]],
@@ -313,7 +313,7 @@ fn find_rotation_matrix_and_det_inplace(
     }
 }
 
-// Zero-allocation inner loop alternative
+// OPTIMIZATION: Zero-allocation inner loop alternative to matching logic
 fn find_centroid_matches_inplace(
     image_centroids: &[[f64; 2]],
     img_len: usize,
@@ -348,7 +348,7 @@ fn find_centroid_matches_inplace(
     indices0.into_iter().map(|idx| matches1[idx]).collect()
 }
 
-// Replaces slow `itertools::multi_cartesian_product` with zero-allocation DFS
+// OPTIMIZATION: Replaces slow `itertools::multi_cartesian_product` with zero-allocation DFS
 fn generate_pattern_keys(
     mins: &[usize],
     maxs: &[usize],
@@ -477,6 +477,7 @@ impl Scratchpads {
 // --- Main Engine ---
 
 pub struct Tetra3 {
+    // OPTIMIZATION: Highly optimized cache-aligned struct lists
     pub star_table_flat: Vec<CatalogStar>,
     pub pattern_catalog_flat: Vec<usize>,
     pub star_kd_tree: KdTree<f64, 3>,
@@ -487,7 +488,7 @@ pub struct Tetra3 {
     pub db_props: HashMap<String, f64>,
     pub num_patterns: usize,
     pub linear_probe: bool,
-    pub scratch: Scratchpads, 
+    pub scratch: Scratchpads, // OPTIMIZATION: Instance-level persistent memory context
     cancelled: AtomicBool,
 }
 
@@ -571,6 +572,7 @@ impl Tetra3 {
         let pattern_key_hashes = read_1d_u16(&mut archive, "pattern_key_hashes.npy");
         let star_catalog_ids = read_1d_u32(&mut archive, "star_catalog_IDs.npy");
 
+        // OPTIMIZATION: Convert massive Array2 allocations to deeply mapped fast internal native slices
         let mut star_table_flat = Vec::with_capacity(star_table_arr.nrows());
         for i in 0..star_table_arr.nrows() {
             star_table_flat.push(CatalogStar {
@@ -807,7 +809,11 @@ impl Tetra3 {
 
         let num_centroids_raw = star_centroids.nrows();
         if num_centroids_raw < p_size {
-            return Solution { status: SolveStatus::TooFew, ..Default::default() };
+            return Solution {
+                status: SolveStatus::TooFew,
+                t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                ..Default::default()
+            };
         }
 
         // Thinning Strategy
@@ -888,11 +894,19 @@ impl Tetra3 {
                         for i in 0..j {
                             if let Some(timeout) = options.solve_timeout_ms {
                                 if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
-                                    return Solution { status: SolveStatus::Timeout, ..Default::default() };
+                                    return Solution {
+                                        status: SolveStatus::Timeout,
+                                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                                        ..Default::default()
+                                    };
                                 }
                             }
                             if self.cancelled.load(Ordering::Relaxed) {
-                                return Solution { status: SolveStatus::Cancelled, ..Default::default() };
+                                return Solution {
+                                    status: SolveStatus::Cancelled,
+                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                                    ..Default::default()
+                                };
                             }
 
                             let p_i = pattern_centroids_inds[i];
@@ -1241,11 +1255,19 @@ impl Tetra3 {
             for image_pattern_indices in breadth_first_combinations(&pattern_centroids_inds, p_size) {
                 if let Some(timeout) = options.solve_timeout_ms {
                     if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
-                        return Solution { status: SolveStatus::Timeout, ..Default::default() };
+                        return Solution {
+                            status: SolveStatus::Timeout,
+                            t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                            ..Default::default()
+                        };
                     }
                 }
                 if self.cancelled.load(Ordering::Relaxed) {
-                    return Solution { status: SolveStatus::Cancelled, ..Default::default() };
+                    return Solution {
+                        status: SolveStatus::Cancelled,
+                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                        ..Default::default()
+                    };
                 }
 
                 for (idx, &i) in image_pattern_indices.iter().enumerate() {
@@ -1501,12 +1523,20 @@ impl Tetra3 {
                         for r in 0..3 { for c in 0..3 { precise_rot_arr2[[r, c]] = precise_rotation_matrix[(r, c)]; } }
 
                         let mut solution = Solution {
-                            ra: Some(ra), dec: Some(dec), roll: Some(roll), fov: Some(fov.to_degrees()), distortion: k_final,
-                            rmse: Some(rms_err_angle), p90e: Some(p90_err_angle), maxe: Some(max_err_angle), matches: Some(num_star_matches),
+                            ra: Some(ra),
+                            dec: Some(dec),
+                            roll: Some(roll),
+                            fov: Some(fov.to_degrees()),
+                            distortion: k_final,
+                            rmse: Some(rms_err_angle),
+                            p90e: Some(p90_err_angle),
+                            maxe: Some(max_err_angle),
+                            matches: Some(num_star_matches),
                             prob: Some(prob_mismatch * (self.num_patterns as f64)),
                             epoch_equinox: self.db_props.get("epoch_equinox").cloned(),
                             epoch_proper_motion: self.db_props.get("epoch_proper_motion").cloned(),
-                            status: SolveStatus::MatchFound, t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                            status: SolveStatus::MatchFound,
+                            t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
                             ..Default::default()
                         };
 

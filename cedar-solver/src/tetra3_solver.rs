@@ -112,6 +112,10 @@ impl SolverTrait for Tetra3Solver {
 
         match result.status {
             SolveStatus::MatchFound => {
+                // Convert the raw f64 milliseconds into a standard Duration, 
+                // then convert that into the required Protobuf Duration struct.
+                let solve_duration = Duration::from_secs_f64(result.t_solve_ms / 1000.0);
+
                 // Populate the correct `PlateSolution` fields cleanly
                 Ok(PlateSolution {
                     image_sky_coord: Some(CelestialCoord {
@@ -123,6 +127,7 @@ impl SolverTrait for Tetra3Solver {
                     distortion: result.distortion,
                     rmse: result.rmse.unwrap_or(0.0),
                     p90_error: result.p90e.unwrap_or(0.0),
+                    solve_time: solve_duration.try_into().ok(),
                     ..Default::default()
                 })
             }
