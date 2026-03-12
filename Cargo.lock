@@ -2755,6 +2755,7 @@ dependencies = [
  "nalgebra 0.34.1",
  "ndarray",
  "npyz",
+ "rayon",
  "statrs",
  "tonic-build",
  "zip",

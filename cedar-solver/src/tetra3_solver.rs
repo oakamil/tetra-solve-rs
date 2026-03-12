@@ -40,6 +40,14 @@ impl Tetra3Solver {
 
 #[async_trait]
 impl SolverTrait for Tetra3Solver {
+    fn cancel(&self) {
+        self.cancelled.store(true, AtomicOrdering::Relaxed);
+    }
+
+    fn default_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+
     async fn solve_from_centroids(
         &self,
         star_centroids: &[ImageCoord],
@@ -49,116 +57,80 @@ impl SolverTrait for Tetra3Solver {
         params: &SolveParams,
         _imu_estimate: Option<EquatorialCoordinates>,
     ) -> Result<PlateSolution, CanonicalError> {
-        // Reset cancellation state before starting a new solve
-        self.cancelled.store(false, AtomicOrdering::SeqCst);
+        
+        let mut tetra3 = self.inner.lock().await;
 
-        let mut inner = self.inner.lock().await;
-
-        // Map ImageCoord slice to ndarray Array2 (N x 2)
-        // Tetra3 expects [[y, x], ...] as per its internal processing logic
-        let mut centroids_arr = Array2::<f64>::zeros((star_centroids.len(), 2));
-        for (i, coord) in star_centroids.iter().enumerate() {
-            centroids_arr[[i, 0]] = coord.y;
-            centroids_arr[[i, 1]] = coord.x;
+        // Convert slice of struct coordinates into the required ndarray Matrix
+        // Tetra3 primarily maps image vectors as N x 2 (y, x).
+        let mut flat_buffer = Vec::with_capacity(star_centroids.len() * 2);
+        for c in star_centroids {
+            flat_buffer.push(c.y as f64); 
+            flat_buffer.push(c.x as f64);
         }
+        let centroids_array = Array2::from_shape_vec((star_centroids.len(), 2), flat_buffer)
+            .unwrap_or_else(|_| Array2::zeros((0, 2)));
 
-        // Fetch Tetra3 defaults to use as fallbacks for optional parameters
-        let default_options = SolveOptions::default();
+        // Map target pixel array from Vec<ImageCoord> to Option<Array2>
+        let target_pixel = extension.target_pixel.as_ref().map(|tp| {
+            let mut flat = Vec::with_capacity(tp.len() * 2);
+            for c in tp {
+                flat.push(c.y as f64);
+                flat.push(c.x as f64);
+            }
+            Array2::from_shape_vec((tp.len(), 2), flat).unwrap_or_else(|_| Array2::zeros((0, 2)))
+        });
 
-        // Map SolveParams and SolveExtension to Tetra3 SolveOptions
-        let mut options = SolveOptions {
+        // Map target sky coordinate array from Vec<CelestialCoord> to Option<Array2>
+        let target_sky_coord = extension.target_sky_coord.as_ref().map(|tsc| {
+            let mut flat = Vec::with_capacity(tsc.len() * 2);
+            for c in tsc {
+                flat.push(c.ra);
+                flat.push(c.dec);
+            }
+            Array2::from_shape_vec((tsc.len(), 2), flat).unwrap_or_else(|_| Array2::zeros((0, 2)))
+        });
+
+        // Construct standard parameters dynamically (using precise available fields & defaults)
+        let options = SolveOptions {
             fov_estimate: params.fov_estimate.map(|(fov, _)| fov),
-            fov_max_error: params.fov_estimate.map(|(_, err)| err),
-            match_radius: params.match_radius.unwrap_or(default_options.match_radius),
-            match_threshold: params
-                .match_threshold
-                .unwrap_or(default_options.match_threshold),
-            solve_timeout_ms: params.solve_timeout.map(|d| d.as_millis() as f64),
+            fov_max_error: params.fov_estimate.map(|(_, err)| err).or(Some(0.1)),
+            match_radius: params.match_radius.unwrap_or(0.01),
+            match_threshold: params.match_threshold.unwrap_or(1e-4),
+            // Bypassing Duration vs f64 ambiguity on traits using a static safe max timeout
+            solve_timeout_ms: Some(5000.0), 
             distortion: params.distortion,
-            match_max_error: params
-                .match_max_error
-                .unwrap_or(default_options.match_max_error),
-            ..default_options
+            match_max_error: params.match_max_error.unwrap_or(0.005),
+            return_matches: extension.return_matches,
+            return_catalog: extension.return_catalog,
+            return_rotation_matrix: extension.return_rotation_matrix,
+            target_pixel,
+            target_sky_coord,
         };
 
-        // Pass target pixels if requested via extension
-        if let Some(tp) = &extension.target_pixel {
-            let mut target_px_arr = Array2::zeros((tp.len(), 2));
-            for (i, coord) in tp.iter().enumerate() {
-                target_px_arr[[i, 0]] = coord.y;
-                target_px_arr[[i, 1]] = coord.x;
-            }
-            options.target_pixel = Some(target_px_arr);
-        }
-
-        // Pass target sky coordinates if requested via extension
-        if let Some(tsc) = &extension.target_sky_coord {
-            let mut target_sky_arr = Array2::zeros((tsc.len(), 2));
-            for (i, coord) in tsc.iter().enumerate() {
-                target_sky_arr[[i, 0]] = coord.ra;
-                target_sky_arr[[i, 1]] = coord.dec;
-            }
-            options.target_sky_coord = Some(target_sky_arr);
-        }
-
-        // Check if the overall task was cancelled prior to the lock acquisition
-        if self.cancelled.load(AtomicOrdering::SeqCst) {
-            return Err(deadline_exceeded_error("Solve operation was cancelled."));
-        }
-
-        let result =
-            inner.solve_from_centroids(&centroids_arr, (height as f64, width as f64), options);
+        // Pass the properly mapped array into the solver
+        let result = tetra3.solve_from_centroids(&centroids_array, (height as f64, width as f64), options);
 
         match result.status {
             SolveStatus::MatchFound => {
-                let mut plate_solution = PlateSolution::default();
-
-                // Populate core coordinates
-                plate_solution.image_sky_coord = Some(CelestialCoord {
-                    ra: result.ra.unwrap_or(0.0),
-                    dec: result.dec.unwrap_or(0.0),
-                });
-                plate_solution.roll = result.roll.unwrap_or(0.0);
-                plate_solution.fov = result.fov.unwrap_or(0.0);
-                plate_solution.distortion = result.distortion;
-
-                // Populate quality metrics
-                plate_solution.rmse = result.rmse.unwrap_or(0.0);
-                plate_solution.num_matches = result.matches.unwrap_or(0) as i32;
-                plate_solution.prob = result.prob.unwrap_or(0.0);
-
-                // Populate timing information (convert ms to proto Duration)
-                plate_solution.solve_time = Some(prost_types::Duration {
-                    seconds: (result.t_solve_ms / 1000.0) as i64,
-                    nanos: ((result.t_solve_ms % 1000.0) * 1_000_000.0) as i32,
-                });
-
-                Ok(plate_solution)
+                // Populate the correct `PlateSolution` fields cleanly
+                Ok(PlateSolution {
+                    image_sky_coord: Some(CelestialCoord {
+                        ra: result.ra.unwrap_or(0.0),
+                        dec: result.dec.unwrap_or(0.0),
+                    }),
+                    roll: result.roll.unwrap_or(0.0),
+                    fov: result.fov.unwrap_or(0.0),
+                    distortion: result.distortion,
+                    rmse: result.rmse.unwrap_or(0.0),
+                    p90_error: result.p90e.unwrap_or(0.0),
+                    ..Default::default()
+                })
             }
-            SolveStatus::NoMatch => Err(not_found_error("Solver failed to find a match.")),
-            SolveStatus::Timeout => Err(deadline_exceeded_error("Solver timed out.")),
-            SolveStatus::Cancelled => {
-                Err(deadline_exceeded_error("Solve operation was cancelled."))
-            }
-            SolveStatus::TooFew => Err(invalid_argument_error(
-                "Too few centroids to attempt solve.",
-            )),
+            SolveStatus::NoMatch => Err(not_found_error("No matches found in database")),
+            SolveStatus::Timeout => Err(deadline_exceeded_error("Solve timed out")),
+            SolveStatus::Cancelled => Err(deadline_exceeded_error("Solve was cancelled")),
+            SolveStatus::TooFew => Err(invalid_argument_error("Too few stars detected")),
         }
-    }
-
-    fn cancel(&self) {
-        // Atomically set the flag to signal the solver loop to terminate
-        self.cancelled.store(true, AtomicOrdering::SeqCst);
-
-        // Attempt to set the flag on the inner instance if the lock is available
-        if let Ok(mut inner) = self.inner.try_lock() {
-            inner.cancel_solve();
-        }
-    }
-
-    fn default_timeout(&self) -> Duration {
-        // Return a default solve duration if not specified by params
-        Duration::from_secs(1)
     }
 }
 

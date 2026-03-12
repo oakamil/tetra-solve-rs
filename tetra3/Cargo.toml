@@ -11,6 +11,7 @@ npyz = "0.8"
 statrs = "0.16"
 kiddo = "3.0"
 nalgebra = "0.34.1"
+rayon = "1.11.0"
 
 [build-dependencies]
 tonic-build = "0.11"
