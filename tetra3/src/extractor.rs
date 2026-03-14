@@ -312,6 +312,7 @@ fn fast_box_blur_2d(
 }
 
 /// Helper: 2D Median Filter using raw slices
+/// Optimization: Allocation hoisted outside the inner loop to eliminate overhead.
 fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size: usize) {
     let pad = (size / 2) as isize;
     let mid = (size * size) / 2;
@@ -320,6 +321,7 @@ fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size:
         .enumerate()
         .for_each(|(y, out_row)| {
             let y_i = y as isize;
+            // Pre-allocate ONCE per row thread
             let mut window = vec![0.0; size * size];
             for x in 0..w {
                 let x_i = x as isize;
@@ -729,11 +731,12 @@ impl TetraExtractor {
 
         // 4. Threshold to find binary mask
         // Fused Fast Extraction: Evaluates Threshold + Binary Erosion (3x3 cross) in a single pass.
-        // Uses Sparse Short-Circuit evaluation to completely avoid allocating/writing to a full WxH bool matrix.
+        // Optimization: Dynamic chunk sizing based on active threads
+        let chunk_size = (height / rayon::current_num_threads()).max(64);
+
         let eroded_pixels: Vec<usize> = match threshold {
             Threshold::Scalar(th) => {
                 if self.config.binary_open {
-                    let chunk_size = 64;
                     let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
                     (0..chunks)
                         .into_par_iter()
@@ -779,7 +782,6 @@ impl TetraExtractor {
             }
             Threshold::Array(arr) => {
                 if self.config.binary_open {
-                    let chunk_size = 64;
                     let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
                     (0..chunks)
                         .into_par_iter()
@@ -828,26 +830,40 @@ impl TetraExtractor {
         };
 
         // Helper: Binary Dilation (3x3 cross)
-        // Instant Dilation Matrix mapped linearly via fast index marking
-        self.mask.resize(width * height, false);
+        // Optimization: Pad the mask by 1px on all edges for zero-bounds-check Connected Components
+        let ext_w = width + 2;
+        let ext_h = height + 2;
+        self.mask.resize(ext_w * ext_h, false);
         self.mask.fill(false);
 
         if self.config.binary_open {
             for &i in &eroded_pixels {
-                self.mask[i] = true;
-                self.mask[i - 1] = true;
-                self.mask[i + 1] = true;
-                self.mask[i - width] = true;
-                self.mask[i + width] = true;
+                let cy = i / width;
+                let cx = i % width;
+                let mi = (cy + 1) * ext_w + (cx + 1);
+
+                self.mask[mi] = true;
+                self.mask[mi - 1] = true;
+                self.mask[mi + 1] = true;
+                self.mask[mi - ext_w] = true;
+                self.mask[mi + ext_w] = true;
             }
         } else {
             for &i in &eroded_pixels {
-                self.mask[i] = true;
+                let cy = i / width;
+                let cx = i % width;
+                let mi = (cy + 1) * ext_w + (cx + 1);
+                self.mask[mi] = true;
             }
         }
 
         let dbg_mask = if self.config.return_images {
-            Some(Array2::from_shape_vec((height, width), self.mask.clone()).unwrap())
+            let mut unpadded_mask = Vec::with_capacity(width * height);
+            for y in 0..height {
+                let start = (y + 1) * ext_w + 1;
+                unpadded_mask.extend_from_slice(&self.mask[start..start + width]);
+            }
+            Some(Array2::from_shape_vec((height, width), unpadded_mask).unwrap())
         } else {
             None
         };
@@ -857,17 +873,22 @@ impl TetraExtractor {
         // 5. Label regions & 6. Accumulate statistics
         // Helper: 4-Connected Components Labeling & Centered Moments executed in a single pass
         for &seed in &eroded_pixels {
-            if !self.mask[seed] {
+            let s_cy = seed / width;
+            let s_cx = seed % width;
+            let m_seed = (s_cy + 1) * ext_w + (s_cx + 1);
+
+            if !self.mask[m_seed] {
                 continue;
             }
 
-            self.mask[seed] = false;
+            self.mask[m_seed] = false;
 
             let mut area = 1;
+            // Reverted to f64: Absolute pixel coordinates squared easily exceed f32 limits
             let val = self.image_vec[seed] as f64;
             let mut sum = val;
-            let sx = (seed % width) as f64;
-            let sy = (seed / width) as f64;
+            let sx = s_cx as f64;
+            let sy = s_cy as f64;
 
             // Apply Parallel Axis Theorem to accumulate variances in single loop
             let mut sum_x = sx * val;
@@ -877,39 +898,42 @@ impl TetraExtractor {
             let mut sum_xy = sx * sy * val;
 
             self.stack.clear();
-            self.stack.push(seed);
+            self.stack.push(m_seed);
 
-            while let Some(idx) = self.stack.pop() {
-                let cy = idx / width;
-                let cx = idx % width;
+            // Bounds-free DFS search thanks to the 1px `ext_w` mask padding boundary
+            while let Some(m_idx) = self.stack.pop() {
+                macro_rules! check_push {
+                    ($ni:expr) => {
+                        if self.mask[$ni] {
+                            self.mask[$ni] = false;
+                            area += 1;
 
-                let mut check_push = |ni: usize, nx: f64, ny: f64| {
-                    if self.mask[ni] {
-                        self.mask[ni] = false;
-                        area += 1;
-                        let v = self.image_vec[ni] as f64;
-                        sum += v;
-                        sum_x += nx * v;
-                        sum_y += ny * v;
-                        sum_xx += nx * nx * v;
-                        sum_yy += ny * ny * v;
-                        sum_xy += nx * ny * v;
-                        self.stack.push(ni);
-                    }
-                };
+                            let my = $ni / ext_w;
+                            let mx = $ni % ext_w;
 
-                if cy > 0 {
-                    check_push(idx - width, cx as f64, (cy - 1) as f64);
+                            // Map padded mask index back to exact image index
+                            let img_idx = (my - 1) * width + (mx - 1);
+                            let v = self.image_vec[img_idx] as f64;
+
+                            sum += v;
+                            let nx = (mx - 1) as f64;
+                            let ny = (my - 1) as f64;
+
+                            sum_x += nx * v;
+                            sum_y += ny * v;
+                            sum_xx += nx * nx * v;
+                            sum_yy += ny * ny * v;
+                            sum_xy += nx * ny * v;
+
+                            self.stack.push($ni);
+                        }
+                    };
                 }
-                if cy + 1 < height {
-                    check_push(idx + width, cx as f64, (cy + 1) as f64);
-                }
-                if cx > 0 {
-                    check_push(idx - 1, (cx - 1) as f64, cy as f64);
-                }
-                if cx + 1 < width {
-                    check_push(idx + 1, (cx + 1) as f64, cy as f64);
-                }
+
+                check_push!(m_idx - ext_w); // Top
+                check_push!(m_idx + ext_w); // Bottom
+                check_push!(m_idx - 1); // Left
+                check_push!(m_idx + 1); // Right
             }
 
             if let Some(min_a) = self.config.min_area {
