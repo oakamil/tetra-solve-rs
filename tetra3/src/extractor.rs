@@ -192,7 +192,6 @@ fn fast_box_blur_2d(
     scratch
         .par_chunks_exact_mut(w)
         .zip(src.par_chunks_exact(w))
-        .with_min_len(64)
         .for_each(|(s_row, i_row)| {
             let mut sum = 0.0_f32;
             if w > 2 * rad {
@@ -319,7 +318,6 @@ fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size:
 
     out.par_chunks_exact_mut(w)
         .enumerate()
-        .with_min_len(64)
         .for_each(|(y, out_row)| {
             let y_i = y as isize;
             let mut window = vec![0.0; size * size];
@@ -424,12 +422,13 @@ impl TetraExtractor {
 
         self.image_vec.clear();
         if let Some(ds) = self.config.downsample {
+            height /= ds;
+            width /= ds;
             self.image_vec.resize(height * width, 0.0);
 
             self.image_vec
                 .par_chunks_exact_mut(width)
                 .enumerate()
-                .with_min_len(64)
                 .for_each(|(y, row)| {
                     for x in 0..width {
                         let mut sum = 0.0;
@@ -438,14 +437,12 @@ impl TetraExtractor {
                                 sum += cropped[[y * ds + dy, x * ds + dx]];
                             }
                         }
+                        // Hardcoded `sum_when_downsample = true` (mathematically identical to Python wrapper)
                         row[x] = sum;
                     }
                 });
         } else {
-            // CRITICAL MEMORY OPTIMIZATION:
-            // Replaced `resize(..., 0.0)` + `copy_from_slice` with `extend_from_slice`.
-            // This eliminates an unneccessary memset of 48MB of zeros over the RAM buffer
-            // prior to overwriting it with the actual image data.
+            // Memory Optimization: Eliminate unnecessary zeroing memset
             if let Some(s) = cropped.as_slice() {
                 self.image_vec.extend_from_slice(s);
             } else {
@@ -474,7 +471,6 @@ impl TetraExtractor {
                     self.scratch
                         .par_chunks_exact_mut(width)
                         .zip(self.image_vec.par_chunks_exact(width))
-                        .with_min_len(64)
                         .for_each(|(s_row, i_row)| {
                             let mut sum = 0.0_f32;
                             if width > 2 * rad {
@@ -730,87 +726,157 @@ impl TetraExtractor {
 
         // 4. Threshold to find binary mask
         // Fused Fast Extraction: Evaluates Threshold + Binary Erosion (3x3 cross) in a single pass.
+        let chunk_size = (height / rayon::current_num_threads()).max(64);
+
         let eroded_pixels: Vec<usize> = match threshold {
             Threshold::Scalar(th) => {
                 if self.config.binary_open {
-                    let chunk_size = 64;
                     let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
-                    
-                    // OPTIMIZATION: Switched from `.fold().reduce(...)` to `.flat_map().collect()`
-                    // This leverages Rayon's FromParallelIterator implementation, which avoids 
-                    // locking allocators to `append()` Vec chunks together.
+
                     (0..chunks)
                         .into_par_iter()
-                        .flat_map(|chunk_idx| {
-                            let mut acc = Vec::with_capacity(128);
-                            let start_y = 1 + chunk_idx * chunk_size;
-                            let end_y = (start_y + chunk_size).min(height - 1);
-                            for y in start_y..end_y {
-                                let row_offset = y * width;
-                                let r_curr = &self.image_vec[row_offset..row_offset + width];
+                        .fold(
+                            || Vec::with_capacity(128),
+                            |mut acc, chunk_idx| {
+                                let start_y = 1 + chunk_idx * chunk_size;
+                                let end_y = (start_y + chunk_size).min(height - 1);
+                                for y in start_y..end_y {
+                                    let row_offset = y * width;
 
-                                for x in 1..width - 1 {
-                                    if r_curr[x] > th {
-                                        let i = row_offset + x;
-                                        if self.image_vec[i - 1] > th
-                                            && self.image_vec[i + 1] > th
-                                            && self.image_vec[i - width] > th
-                                            && self.image_vec[i + width] > th
-                                        {
-                                            acc.push(i);
+                                    // Optimization: Extracting exact row slices enables the compiler to mathematically prove
+                                    // boundary safety, entirely stripping vector bounds checks from the inner `x` loop.
+                                    let r_prev = &self.image_vec[(y - 1) * width..y * width];
+                                    let r_curr = &self.image_vec[y * width..(y + 1) * width];
+                                    let r_next = &self.image_vec[(y + 1) * width..(y + 2) * width];
+
+                                    for x in 1..width - 1 {
+                                        if r_curr[x] > th {
+                                            if r_curr[x - 1] > th
+                                                && r_curr[x + 1] > th
+                                                && r_prev[x] > th
+                                                && r_next[x] > th
+                                            {
+                                                acc.push(row_offset + x);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            acc
-                        })
-                        .collect()
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || Vec::new(),
+                            |mut a, mut b| {
+                                a.append(&mut b);
+                                a
+                            },
+                        )
                 } else {
-                    self.image_vec
-                        .par_iter()
-                        .enumerate()
-                        .filter_map(|(i, &v)| if v > th { Some(i) } else { None })
-                        .collect()
+                    let chunks = (height + chunk_size - 1) / chunk_size;
+                    (0..chunks)
+                        .into_par_iter()
+                        .fold(
+                            || Vec::with_capacity(128),
+                            |mut acc, chunk_idx| {
+                                let start_y = chunk_idx * chunk_size;
+                                let end_y = (start_y + chunk_size).min(height);
+                                for y in start_y..end_y {
+                                    let row_offset = y * width;
+                                    let r_curr = &self.image_vec[row_offset..row_offset + width];
+
+                                    for x in 0..width {
+                                        if r_curr[x] > th {
+                                            acc.push(row_offset + x);
+                                        }
+                                    }
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || Vec::new(),
+                            |mut a, mut b| {
+                                a.append(&mut b);
+                                a
+                            },
+                        )
                 }
             }
             Threshold::Array(arr) => {
                 if self.config.binary_open {
-                    let chunk_size = 64;
                     let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
+
                     (0..chunks)
                         .into_par_iter()
-                        .flat_map(|chunk_idx| {
-                            let mut acc = Vec::with_capacity(128);
-                            let start_y = 1 + chunk_idx * chunk_size;
-                            let end_y = (start_y + chunk_size).min(height - 1);
-                            for y in start_y..end_y {
-                                let row_offset = y * width;
-                                let r_curr = &self.image_vec[row_offset..row_offset + width];
-                                let t_curr = &arr[row_offset..row_offset + width];
+                        .fold(
+                            || Vec::with_capacity(128),
+                            |mut acc, chunk_idx| {
+                                let start_y = 1 + chunk_idx * chunk_size;
+                                let end_y = (start_y + chunk_size).min(height - 1);
+                                for y in start_y..end_y {
+                                    let row_offset = y * width;
 
-                                for x in 1..width - 1 {
-                                    if r_curr[x] > t_curr[x] {
-                                        let i = row_offset + x;
-                                        if self.image_vec[i - 1] > arr[i - 1]
-                                            && self.image_vec[i + 1] > arr[i + 1]
-                                            && self.image_vec[i - width] > arr[i - width]
-                                            && self.image_vec[i + width] > arr[i + width]
-                                        {
-                                            acc.push(i);
+                                    // Optimization: Complete bounds-check elimination via exact slice lengths
+                                    let r_prev = &self.image_vec[(y - 1) * width..y * width];
+                                    let r_curr = &self.image_vec[y * width..(y + 1) * width];
+                                    let r_next = &self.image_vec[(y + 1) * width..(y + 2) * width];
+
+                                    let t_prev = &arr[(y - 1) * width..y * width];
+                                    let t_curr = &arr[y * width..(y + 1) * width];
+                                    let t_next = &arr[(y + 1) * width..(y + 2) * width];
+
+                                    for x in 1..width - 1 {
+                                        if r_curr[x] > t_curr[x] {
+                                            if r_curr[x - 1] > t_curr[x - 1]
+                                                && r_curr[x + 1] > t_curr[x + 1]
+                                                && r_prev[x] > t_prev[x]
+                                                && r_next[x] > t_next[x]
+                                            {
+                                                acc.push(row_offset + x);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            acc
-                        })
-                        .collect()
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || Vec::new(),
+                            |mut a, mut b| {
+                                a.append(&mut b);
+                                a
+                            },
+                        )
                 } else {
-                    self.image_vec
-                        .par_iter()
-                        .zip(arr.par_iter())
-                        .enumerate()
-                        .filter_map(|(i, (&v, &t))| if v > t { Some(i) } else { None })
-                        .collect()
+                    let chunks = (height + chunk_size - 1) / chunk_size;
+                    (0..chunks)
+                        .into_par_iter()
+                        .fold(
+                            || Vec::with_capacity(128),
+                            |mut acc, chunk_idx| {
+                                let start_y = chunk_idx * chunk_size;
+                                let end_y = (start_y + chunk_size).min(height);
+                                for y in start_y..end_y {
+                                    let row_offset = y * width;
+                                    let r_curr = &self.image_vec[row_offset..row_offset + width];
+                                    let t_curr = &arr[row_offset..row_offset + width];
+
+                                    for x in 0..width {
+                                        if r_curr[x] > t_curr[x] {
+                                            acc.push(row_offset + x);
+                                        }
+                                    }
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || Vec::new(),
+                            |mut a, mut b| {
+                                a.append(&mut b);
+                                a
+                            },
+                        )
                 }
             }
         };

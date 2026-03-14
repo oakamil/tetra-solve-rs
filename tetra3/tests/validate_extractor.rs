@@ -18,7 +18,7 @@ from PIL import Image
 import numpy as np
 from tetra3.tetra3 import get_centroids_from_image
 
-def load_image_as_array(path):
+def load_image_as_array(path, crop_to_multiple_of=1):
     image = Image.open(path)
     image = np.asarray(image, dtype=np.float32)
     if image.ndim == 3:
@@ -26,7 +26,17 @@ def load_image_as_array(path):
             image = image[:, :, 0]*.299 + image[:, :, 1]*.587 + image[:, :, 2]*.114
         else:
             image = image.squeeze(axis=2)
-    return image
+            
+    # CRITICAL FIX: Truncate remainder pixels for safe downsampling.
+    # NumPy reshaping in tetra3.py and binning in cedar-detect will crash if dimensions
+    # are not perfectly divisible by the downsample factor. 
+    if crop_to_multiple_of > 1:
+        h, w = image.shape
+        new_h = h - (h % crop_to_multiple_of)
+        new_w = w - (w % crop_to_multiple_of)
+        image = image[:new_h, :new_w]
+        
+    return np.ascontiguousarray(image)
 
 def run_py_extraction(image_array, bg_sub_mode, sigma_mode, downsample):
     # Handle the "None" string gracefully for Python logic
@@ -64,10 +74,12 @@ def run_py_extraction(image_array, bg_sub_mode, sigma_mode, downsample):
         ]
     )
 
-def run_py_extraction_perf(image_array):
+def run_py_extraction_perf(image_array, downsample):
+    if downsample == 0:
+        downsample = None
     # Execute the extraction but do not allocate wrapper arrays or return data over the PyO3 boundary.
     # This ensures the timer strictly captures the algorithmic execution time.
-    get_centroids_from_image(image_array, return_moments=True)
+    get_centroids_from_image(image_array, downsample=downsample, return_moments=True)
 "#;
 
 /// Helper function to locate and return the test images, maximizing code reuse across tests.
@@ -112,7 +124,8 @@ fn run_validation_suite(
     let image_paths = get_test_images();
 
     Python::with_gil(|py| {
-        let module = PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
+        let module =
+            PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
         let load_image_as_array = module.getattr("load_image_as_array").unwrap();
         let run_py_extraction = module.getattr("run_py_extraction").unwrap();
 
@@ -120,52 +133,45 @@ fn run_validation_suite(
             let img_name = image_path.file_name().unwrap();
             println!("\nTesting image: {:?}", img_name);
 
-            // 1. Load the image into Python and get the raw f32 numpy array.
-            let py_image_array: &PyAny = load_image_as_array
-                .call1((image_path.to_str().unwrap(),))
-                .unwrap();
-
-            // Extract the Array2<f32> for Rust.
-            // We do a manual copy into a Vec to bridge the gap between `numpy`'s ndarray v0.15
-            // and the main crate's ndarray v0.17, avoiding version-conflict compile errors.
-            let py_readonly_img: PyReadonlyArray2<f32> = py_image_array.extract().unwrap();
-            let py_view = py_readonly_img.as_array();
-            let nrows = py_view.shape()[0];
-            let ncols = py_view.shape()[1];
-
-            let mut vec_data = Vec::with_capacity(nrows * ncols);
-            for r in 0..nrows {
-                for c in 0..ncols {
-                    vec_data.push(*py_view.get([r, c]).unwrap());
-                }
-            }
-            let rust_input_img: Array2<f32> =
-                Array2::from_shape_vec((nrows, ncols), vec_data).unwrap();
-
             for &ds_opt in downsamples {
-                // Prevent Python crash: Skip images where dimensions are not perfectly divisible by the binning factor
-                if let Some(ds) = ds_opt {
-                    if nrows % ds != 0 || ncols % ds != 0 {
-                        println!(
-                            "  -> Skipping downsample {}x{} for {:?} (dimensions {}x{} not cleanly divisible)",
-                            ds, ds, img_name, ncols, nrows
-                        );
-                        continue;
+                let ds_val = ds_opt.unwrap_or(1);
+
+                // 1. Load the image into Python and get the raw f32 numpy array.
+                // We pass the downsample factor so Python can crop remainder pixels
+                let py_image_array: &PyAny = load_image_as_array
+                    .call1((image_path.to_str().unwrap(), ds_val))
+                    .unwrap();
+
+                // Extract the Array2<f32> for Rust.
+                // We do a manual copy into a Vec to bridge the gap between `numpy`'s ndarray v0.15
+                // and the main crate's ndarray v0.17, avoiding version-conflict compile errors.
+                let py_readonly_img: PyReadonlyArray2<f32> = py_image_array.extract().unwrap();
+                let py_view = py_readonly_img.as_array();
+                let nrows = py_view.shape()[0];
+                let ncols = py_view.shape()[1];
+
+                let mut vec_data = Vec::with_capacity(nrows * ncols);
+                for r in 0..nrows {
+                    for c in 0..ncols {
+                        vec_data.push(*py_view.get([r, c]).unwrap());
                     }
                 }
+                let rust_input_img: Array2<f32> =
+                    Array2::from_shape_vec((nrows, ncols), vec_data).unwrap();
 
                 let py_ds = ds_opt.unwrap_or(0);
-                
+
                 // Iterate through every combination of modes
                 for (bg_rs, bg_py) in bg_modes {
                     for (sig_rs, sig_py) in sigma_modes {
-                        let mut extractor = tetra3::extractor::TetraExtractor::new(CentroidConfig {
-                            bg_sub_mode: *bg_rs,
-                            sigma_mode: *sig_rs,
-                            downsample: ds_opt,
-                            return_images: false,
-                            ..Default::default()
-                        });
+                        let mut extractor =
+                            tetra3::extractor::TetraExtractor::new(CentroidConfig {
+                                bg_sub_mode: *bg_rs,
+                                sigma_mode: *sig_rs,
+                                downsample: ds_opt,
+                                return_images: false,
+                                ..Default::default()
+                            });
 
                         // 2. Run Python Algorithm
                         println!(
@@ -226,7 +232,8 @@ fn run_validation_suite(
                                 .then_with(|| q_coord(a.x).cmp(&q_coord(b.x)))
                         });
 
-                        let mut py_indices: Vec<usize> = (0..py_centroids_view.shape()[0]).collect();
+                        let mut py_indices: Vec<usize> =
+                            (0..py_centroids_view.shape()[0]).collect();
                         py_indices.sort_by(|&i, &j| {
                             let sum_i = py_sum.get(i).unwrap();
                             let sum_j = py_sum.get(j).unwrap();
@@ -507,6 +514,7 @@ fn test_extraction_against_python_binning() {
         tetra3::extractor::SigmaMode::GlobalRootSquare,
         "global_root_square",
     )];
+    // No more skipping! The Python loader automatically aligns dimensions.
     let downsamples = [Some(2), Some(4)];
 
     run_validation_suite(&bg_modes, &sigma_modes, &downsamples);
@@ -558,21 +566,27 @@ fn test_extraction_against_python_full() {
 }
 
 #[test]
-#[ignore]
 fn test_performance_vs_python() {
     let mut total_rust_time = Duration::ZERO;
     let mut total_py_time = Duration::ZERO;
     let iterations = 10;
     let image_paths = get_test_images();
 
+    // Centralized downsample control for performance tests
+    let ds_opt = None;
+    let ds_val = ds_opt.unwrap_or(1);
+    let py_ds_arg = ds_opt.unwrap_or(0);
+
     // Initialize global buffer to prevent OS allocation overhead during benchmarking
     let mut tetra_extractor = TetraExtractor::new(CentroidConfig {
+        downsample: ds_opt,
         return_images: false,
         ..Default::default()
     });
 
     Python::with_gil(|py| {
-        let module = PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
+        let module =
+            PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
         let load_image_as_array = module.getattr("load_image_as_array").unwrap();
         let run_py_extraction_perf = module.getattr("run_py_extraction_perf").unwrap();
 
@@ -580,26 +594,29 @@ fn test_performance_vs_python() {
         let mut preloaded_images = Vec::new();
         for path in &image_paths {
             let py_image_array: &PyAny = load_image_as_array
-                .call1((path.to_str().unwrap(),))
+                .call1((path.to_str().unwrap(), ds_val))
                 .unwrap();
 
             let py_readonly_img: PyReadonlyArray2<f32> = py_image_array.extract().unwrap();
             let py_view = py_readonly_img.as_array();
             let rust_input_img: Array2<f32> =
-                Array2::from_shape_fn((py_view.nrows(), py_view.ncols()), |(y, x)| {
-                    py_view[[y, x]]
-                });
+                Array2::from_shape_fn((py_view.nrows(), py_view.ncols()), |(y, x)| py_view[[y, x]]);
 
             preloaded_images.push((py_image_array, rust_input_img));
         }
 
-        println!("Running {} iterations vs Python for accurate benchmarking...", iterations);
+        println!(
+            "Running {} iterations vs Python for accurate benchmarking...",
+            iterations
+        );
 
         for _ in 0..iterations {
             for (py_image_array, rust_input_img) in &preloaded_images {
                 // Run Python Algorithm
                 let start_py = Instant::now();
-                let _py_result = run_py_extraction_perf.call1((*py_image_array,)).unwrap();
+                let _py_result = run_py_extraction_perf
+                    .call1((*py_image_array, py_ds_arg))
+                    .unwrap();
                 total_py_time += start_py.elapsed();
 
                 // Run Rust Algorithm (Tetra3 Port)
@@ -614,16 +631,27 @@ fn test_performance_vs_python() {
 
     println!("\n==============================================");
     println!("PERFORMANCE REPORT: RUST VS PYTHON");
-    println!("Images tested: {} ({} unique x {} iterations)", image_count, image_paths.len(), iterations);
+    println!(
+        "Images tested: {} ({} unique x {} iterations)",
+        image_count,
+        image_paths.len(),
+        iterations
+    );
     println!("----------------------------------------------");
     println!("Python (tetra3) Total Time : {:.2?}", total_py_time);
     if image_count > 0 {
-        println!("Python (tetra3) Avg/Image  : {:.2?}", total_py_time / image_count as u32);
+        println!(
+            "Python (tetra3) Avg/Image  : {:.2?}",
+            total_py_time / image_count as u32
+        );
     }
     println!("----------------------------------------------");
     println!("Rust (Port) Total Time     : {:.2?}", total_rust_time);
     if image_count > 0 {
-        println!("Rust (Port) Avg/Image      : {:.2?}", total_rust_time / image_count as u32);
+        println!(
+            "Rust (Port) Avg/Image      : {:.2?}",
+            total_rust_time / image_count as u32
+        );
     }
     println!("----------------------------------------------");
 
@@ -634,80 +662,116 @@ fn test_performance_vs_python() {
 
 #[test]
 fn test_performance_vs_cedar() {
-    let mut total_rust_time = Duration::ZERO;
-    let mut total_cedar_time = Duration::ZERO;
-    let iterations = 100;
+    let iterations = 50;
     let image_paths = get_test_images();
+    let downsamples = [None, Some(2), Some(4)];
 
-    let mut tetra_extractor = TetraExtractor::new(CentroidConfig {
-        return_images: false,
-        ..Default::default()
-    });
+    for &ds_opt in &downsamples {
+        let mut total_rust_time = Duration::ZERO;
+        let mut total_cedar_time = Duration::ZERO;
 
-    // Use Python loader to ensure perfectly identical f32-to-Luma u8 pixel math 
-    // across both algorithms prior to benchmarking.
-    let mut preloaded_images = Vec::new();
-    Python::with_gil(|py| {
-        let module = PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
-        let load_image_as_array = module.getattr("load_image_as_array").unwrap();
+        let ds_val = ds_opt.unwrap_or(1);
+        let cedar_ds = ds_opt.unwrap_or(1) as u32;
 
-        for path in &image_paths {
-            let py_image_array: &PyAny = load_image_as_array
-                .call1((path.to_str().unwrap(),))
-                .unwrap();
+        let mut tetra_extractor = TetraExtractor::new(CentroidConfig {
+            downsample: ds_opt,
+            return_images: false,
+            ..Default::default()
+        });
 
-            let py_readonly_img: PyReadonlyArray2<f32> = py_image_array.extract().unwrap();
-            let py_view = py_readonly_img.as_array();
-            let rust_input_img: Array2<f32> =
-                Array2::from_shape_fn((py_view.nrows(), py_view.ncols()), |(y, x)| py_view[[y, x]]);
+        // Use Python loader to ensure perfectly identical f32-to-Luma u8 pixel math
+        // across both algorithms prior to benchmarking.
+        let mut preloaded_images = Vec::new();
+        Python::with_gil(|py| {
+            let module =
+                PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
+            let load_image_as_array = module.getattr("load_image_as_array").unwrap();
 
-            let (height, width) = (rust_input_img.nrows(), rust_input_img.ncols());
-            let mut cedar_img = GrayImage::new(width as u32, height as u32);
-            for y in 0..height {
-                for x in 0..width {
-                    let p_val = rust_input_img[[y, x]].clamp(0.0, 255.0) as u8;
-                    cedar_img.put_pixel(x as u32, y as u32, image::Luma([p_val]));
+            for path in &image_paths {
+                let py_image_array: &PyAny = load_image_as_array
+                    .call1((path.to_str().unwrap(), ds_val))
+                    .unwrap();
+
+                let py_readonly_img: PyReadonlyArray2<f32> = py_image_array.extract().unwrap();
+                let py_view = py_readonly_img.as_array();
+                let rust_input_img: Array2<f32> =
+                    Array2::from_shape_fn((py_view.nrows(), py_view.ncols()), |(y, x)| {
+                        py_view[[y, x]]
+                    });
+
+                let (height, width) = (rust_input_img.nrows(), rust_input_img.ncols());
+                let mut cedar_img = GrayImage::new(width as u32, height as u32);
+                for y in 0..height {
+                    for x in 0..width {
+                        let p_val = rust_input_img[[y, x]].clamp(0.0, 255.0) as u8;
+                        cedar_img.put_pixel(x as u32, y as u32, image::Luma([p_val]));
+                    }
                 }
+
+                preloaded_images.push((rust_input_img, cedar_img));
             }
+        });
 
-            preloaded_images.push((rust_input_img, cedar_img));
+        println!(
+            "Running {} iterations vs Cedar-Detect (Downsample: {:?})...",
+            iterations, ds_opt
+        );
+
+        for _ in 0..iterations {
+            for (rust_input_img, cedar_img) in &preloaded_images {
+                // Run Rust Algorithm (Tetra3 Port)
+                let start_rust = Instant::now();
+                let _rust_result = tetra_extractor.extract(rust_input_img);
+                total_rust_time += start_rust.elapsed();
+
+                // Run Cedar Detect Algorithm
+                let start_cedar = Instant::now();
+                let noise_estimate = estimate_noise_from_image(cedar_img);
+                let _cedar_result = get_stars_from_image(
+                    cedar_img,
+                    noise_estimate,
+                    8.0,
+                    false,
+                    cedar_ds,
+                    true,
+                    false,
+                );
+                total_cedar_time += start_cedar.elapsed();
+            }
         }
-    });
 
-    println!("Running {} iterations vs Cedar-Detect for accurate benchmarking...", iterations);
+        let image_count = iterations * image_paths.len();
 
-    for _ in 0..iterations {
-        for (rust_input_img, cedar_img) in &preloaded_images {
-            // Run Rust Algorithm (Tetra3 Port)
-            let start_rust = Instant::now();
-            let _rust_result = tetra_extractor.extract(rust_input_img);
-            total_rust_time += start_rust.elapsed();
-
-            // Run Cedar Detect Algorithm
-            let start_cedar = Instant::now();
-            let noise_estimate = estimate_noise_from_image(cedar_img);
-            let _cedar_result = get_stars_from_image(cedar_img, noise_estimate, 8.0, false, 1, true, false);
-            total_cedar_time += start_cedar.elapsed();
+        println!("\n==============================================");
+        println!(
+            "PERFORMANCE REPORT: RUST PORT VS CEDAR-DETECT (DS: {:?})",
+            ds_opt
+        );
+        println!(
+            "Images tested: {} ({} unique x {} iterations)",
+            image_count,
+            image_paths.len(),
+            iterations
+        );
+        println!("----------------------------------------------");
+        println!("Rust (Port) Total Time     : {:.2?}", total_rust_time);
+        if image_count > 0 {
+            println!(
+                "Rust (Port) Avg/Image      : {:.2?}",
+                total_rust_time / image_count as u32
+            );
         }
+        println!("----------------------------------------------");
+        println!("Rust (CedarDetect) Total   : {:.2?}", total_cedar_time);
+        if image_count > 0 {
+            println!(
+                "Rust (CedarDetect) Avg     : {:.2?}",
+                total_cedar_time / image_count as u32
+            );
+        }
+        println!("----------------------------------------------");
+        let speedup = total_cedar_time.as_secs_f64() / total_rust_time.as_secs_f64();
+        println!("Port Speedup vs Cedar      : {:.2}x", speedup);
+        println!("==============================================\n");
     }
-
-    let image_count = iterations * image_paths.len();
-
-    println!("\n==============================================");
-    println!("PERFORMANCE REPORT: RUST PORT VS CEDAR-DETECT");
-    println!("Images tested: {} ({} unique x {} iterations)", image_count, image_paths.len(), iterations);
-    println!("----------------------------------------------");
-    println!("Rust (Port) Total Time     : {:.2?}", total_rust_time);
-    if image_count > 0 {
-        println!("Rust (Port) Avg/Image      : {:.2?}", total_rust_time / image_count as u32);
-    }
-    println!("----------------------------------------------");
-    println!("Rust (CedarDetect) Total   : {:.2?}", total_cedar_time);
-    if image_count > 0 {
-        println!("Rust (CedarDetect) Avg     : {:.2?}", total_cedar_time / image_count as u32);
-    }
-    println!("----------------------------------------------");
-    let speedup = total_cedar_time.as_secs_f64() / total_rust_time.as_secs_f64();
-    println!("Port Speedup vs Cedar      : {:.2}x", speedup);
-    println!("==============================================\n");
 }
