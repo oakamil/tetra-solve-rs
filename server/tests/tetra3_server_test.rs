@@ -67,7 +67,7 @@ async fn test_solve_from_image_batch() -> Result<(), Box<dyn std::error::Error>>
     entries.sort(); // Process in alphabetical order
 
     println!(
-        "{:<35} | {:<8} | {:<8} | {:<8} | {:<8} | {:<12} | {:<12} | {:<12}",
+        "{:<40} | {:<8} | {:<8} | {:<8} | {:<8} | {:<12} | {:<12} | {:<12}",
         "Image Name",
         "RA (°)",
         "Dec (°)",
@@ -77,19 +77,11 @@ async fn test_solve_from_image_batch() -> Result<(), Box<dyn std::error::Error>>
         "Solve (ms)",
         "Total (ms)"
     );
-    println!("{:-<125}", "");
+    println!("{:-<130}", "");
 
     // 5. Process each image
     for img_path in entries {
         let file_name = img_path.file_name().unwrap().to_string_lossy().to_string();
-
-        // Truncate long file names
-        let max_name_len = 35;
-        let display_name = if file_name.len() > max_name_len {
-            format!("{}...", &file_name[0..(max_name_len - 3)])
-        } else {
-            file_name
-        };
 
         // Load image and convert to 32-bit float grayscale
         let img = image::open(&img_path)?.to_luma32f();
@@ -101,7 +93,7 @@ async fn test_solve_from_image_batch() -> Result<(), Box<dyn std::error::Error>>
 
         // Create a unique shared memory segment for this image
         let shmem_name = format!("/tetra3_test_shmem_{}", uuid::Uuid::new_v4().simple());
-        let mut shmem = ShmemConf::new()
+        let shmem = ShmemConf::new()
             .os_id(&shmem_name)
             .size(byte_size)
             .create()?;
@@ -156,8 +148,8 @@ async fn test_solve_from_image_batch() -> Result<(), Box<dyn std::error::Error>>
         let total_ms_str = format!("{:.2}", total_ms);
 
         println!(
-            "{:<35} | {:<8} | {:<8} | {:<8} | {:<8} | {:<12} | {:<12} | {:<12}",
-            display_name, ra, dec, roll, fov, extract_ms, solve_ms, total_ms_str
+            "{:<40.40} | {:<8} | {:<8} | {:<8} | {:<8} | {:<12} | {:<12} | {:<12}",
+            file_name, ra, dec, roll, fov, extract_ms, solve_ms, total_ms_str
         );
 
         // Shmem goes out of scope and is automatically unlinked/freed here for this iteration
