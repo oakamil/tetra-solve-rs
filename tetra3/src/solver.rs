@@ -1569,7 +1569,7 @@ impl Solver {
                             edges.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
                             let image_pattern_largest_edge = edges[5];
 
-                            // Min/max edge ration bounds
+                            // Min/max edge ratio bounds
                             let mut key_space_min = [0; 5];
                             let mut key_space_max = [0; 5];
                             let mut target_keys = [0isize; 5];
@@ -1816,7 +1816,7 @@ impl Solver {
                         .push(scratch.sp_edge_angles[i] / image_pattern_largest_edge);
                 }
 
-                // Min/max edge ration bounds
+                // Min/max edge ratio bounds
                 scratch.sp_pattern_key_space_min.clear();
                 scratch.sp_pattern_key_space_max.clear();
                 scratch.sp_image_pattern_key.clear();
