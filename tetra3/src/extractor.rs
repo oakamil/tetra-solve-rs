@@ -67,7 +67,7 @@
 //    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //    SOFTWARE.
 
-use ndarray::{Array2, s};
+use ndarray::{Array2, ArrayBase, Data, Ix2, s};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 
@@ -372,7 +372,10 @@ impl Extractor {
     }
 
     /// Extract spot centroids from an image and calculate statistics.
-    pub fn extract(&mut self, input_image: &Array2<f32>) -> ExtractionResult {
+    pub fn extract<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> ExtractionResult
+    where
+        S: Data<Elem = f32>,
+    {
         // 1. Crop and downsample
         // Note: Cropping is applied before downsampling.
         let (full_height, full_width) = input_image.dim();
