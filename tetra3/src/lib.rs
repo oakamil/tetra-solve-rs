@@ -3,5 +3,8 @@
 
 pub mod extractor;
 pub mod solver;
+pub mod tetra3;
+
 pub use crate::extractor::*;
 pub use crate::solver::*;
+pub use crate::tetra3::*;

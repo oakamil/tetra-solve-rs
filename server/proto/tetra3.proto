@@ -78,7 +78,7 @@ message CropRegion {
     int64 offset_x = 4;
 }
 
-message CentroidConfig {
+message ExtractOptions {
     optional float sigma = 1;
     optional float image_th = 2;
     Crop crop = 3;
@@ -179,12 +179,12 @@ message SolveRequest {
 
 message ExtractRequest {
     ImageInput image = 1;
-    CentroidConfig config = 2;
+    ExtractOptions options = 2;
 }
 
 message SolveFromImageRequest {
     ImageInput image = 1;
-    CentroidConfig extract_config = 2;
+    ExtractOptions extract_options = 2;
     SolveOptions solve_options = 3;
 }
 

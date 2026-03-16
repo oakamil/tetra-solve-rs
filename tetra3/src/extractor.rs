@@ -103,7 +103,7 @@ pub enum Crop {
 }
 
 #[derive(Debug, Clone)]
-pub struct CentroidConfig {
+pub struct ExtractOptions {
     pub sigma: f32,
     pub image_th: Option<f32>,
     pub crop: Option<Crop>,
@@ -122,9 +122,9 @@ pub struct CentroidConfig {
     pub return_images: bool,
 }
 
-impl Default for CentroidConfig {
+impl Default for ExtractOptions {
     fn default() -> Self {
-        CentroidConfig {
+        ExtractOptions {
             sigma: 2.0,
             image_th: None,
             crop: None,
@@ -349,19 +349,17 @@ fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size:
 /// Extractor maintains pre-allocated global buffers to eliminate OS memory allocations
 /// during continuous execution, fulfilling the zero-allocation performance pattern.
 pub struct Extractor {
-    pub config: CentroidConfig,
     image_vec: Vec<f32>,
     scratch: Vec<f32>,
     median_scratch: Vec<f32>,
     std_img: Vec<f32>,
     mask: Vec<bool>,
-    stack: Vec<usize>, // Tiny stack size keeps the L1 cache hot on Pi 5 (bandwidth constrained)
+    stack: Vec<usize>, // Tiny stack size keeps the L1 cache hot on Pi (bandwidth constrained)
 }
 
 impl Extractor {
-    pub fn new(config: CentroidConfig) -> Self {
+    pub fn new() -> Self {
         Self {
-            config,
             image_vec: Vec::new(),
             scratch: Vec::new(),
             median_scratch: Vec::new(),
@@ -372,7 +370,11 @@ impl Extractor {
     }
 
     /// Extract spot centroids from an image and calculate statistics.
-    pub fn extract<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> ExtractionResult
+    pub fn extract<S>(
+        &mut self,
+        input_image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> ExtractionResult
     where
         S: Data<Elem = f32>,
     {
@@ -380,7 +382,7 @@ impl Extractor {
         // Note: Cropping is applied before downsampling.
         let (full_height, full_width) = input_image.dim();
 
-        let (mut height, mut width, offs_h_isize, offs_w_isize) = match self.config.crop {
+        let (mut height, mut width, offs_h_isize, offs_w_isize) = match options.crop {
             Some(Crop::Fraction(f)) => (full_height / f, full_width / f, 0isize, 0isize),
             Some(Crop::Center {
                 height: h,
@@ -398,8 +400,8 @@ impl Extractor {
         let final_offs_h;
         let final_offs_w;
 
-        if self.config.crop.is_some() {
-            let divisor = self.config.downsample.unwrap_or(2);
+        if options.crop.is_some() {
+            let divisor = options.downsample.unwrap_or(2);
             height = ((height as f32 / divisor as f32).ceil() as usize) * divisor;
             width = ((width as f32 / divisor as f32).ceil() as usize) * divisor;
             height = height.min(full_height);
@@ -420,7 +422,7 @@ impl Extractor {
         ]);
 
         self.image_vec.clear();
-        if let Some(ds) = self.config.downsample {
+        if let Some(ds) = options.downsample {
             height /= ds;
             width /= ds;
             self.image_vec.resize(height * width, 0.0);
@@ -452,7 +454,7 @@ impl Extractor {
             }
         }
 
-        let dbg_cropped = if self.config.return_images {
+        let dbg_cropped = if options.return_images {
             Some(Array2::from_shape_vec((height, width), self.image_vec.clone()).unwrap())
         } else {
             None
@@ -460,12 +462,12 @@ impl Extractor {
 
         // 2. Subtract background
         // Fused background subtraction + RMS calculation (Evaluated as an expression)
-        let sum_sq_global: f64 = if let Some(mode) = self.config.bg_sub_mode {
+        let sum_sq_global: f64 = if let Some(mode) = options.bg_sub_mode {
             match mode {
                 BgSubMode::LocalMean => {
                     self.scratch.resize(width * height, 0.0);
-                    let rad = self.config.filtsize / 2;
-                    let area = (self.config.filtsize * self.config.filtsize) as f32;
+                    let rad = options.filtsize / 2;
+                    let area = (options.filtsize * options.filtsize) as f32;
 
                     self.scratch
                         .par_chunks_exact_mut(width)
@@ -635,7 +637,7 @@ impl Extractor {
                         &mut self.scratch,
                         width,
                         height,
-                        self.config.filtsize,
+                        options.filtsize,
                     );
                     let bg = &self.scratch;
                     self.image_vec
@@ -655,7 +657,7 @@ impl Extractor {
                 .sum()
         };
 
-        let dbg_bg_sub = if self.config.return_images {
+        let dbg_bg_sub = if options.return_images {
             Some(Array2::from_shape_vec((height, width), self.image_vec.clone()).unwrap())
         } else {
             None
@@ -667,13 +669,13 @@ impl Extractor {
             Array(&'a [f32]),
         }
 
-        let threshold = if let Some(th) = self.config.image_th {
+        let threshold = if let Some(th) = options.image_th {
             Threshold::Scalar(th)
         } else {
-            match self.config.sigma_mode {
+            match options.sigma_mode {
                 SigmaMode::GlobalRootSquare => {
                     let mean_sq = (sum_sq_global / (height * width) as f64) as f32;
-                    Threshold::Scalar(mean_sq.max(0.0).sqrt() * self.config.sigma)
+                    Threshold::Scalar(mean_sq.max(0.0).sqrt() * options.sigma)
                 }
                 SigmaMode::GlobalMedianAbs => {
                     self.median_scratch.clear();
@@ -684,7 +686,7 @@ impl Extractor {
                         self.median_scratch.select_nth_unstable_by(mid, |a, b| {
                             a.partial_cmp(b).unwrap_or(Ordering::Equal)
                         });
-                    Threshold::Scalar(median * 1.48 * self.config.sigma)
+                    Threshold::Scalar(median * 1.48 * options.sigma)
                 }
                 SigmaMode::LocalMedianAbs => {
                     self.std_img.resize(width * height, 0.0);
@@ -695,11 +697,11 @@ impl Extractor {
                         &mut self.std_img,
                         width,
                         height,
-                        self.config.filtsize,
+                        options.filtsize,
                     );
                     self.std_img
                         .par_iter_mut()
-                        .for_each(|v| *v *= 1.48 * self.config.sigma);
+                        .for_each(|v| *v *= 1.48 * options.sigma);
                     Threshold::Array(&self.std_img)
                 }
                 SigmaMode::LocalRootSquare => {
@@ -713,11 +715,11 @@ impl Extractor {
                         &mut self.std_img,
                         width,
                         height,
-                        self.config.filtsize,
+                        options.filtsize,
                     );
                     self.std_img
                         .par_iter_mut()
-                        .for_each(|v| *v = v.max(0.0).sqrt() * self.config.sigma);
+                        .for_each(|v| *v = v.max(0.0).sqrt() * options.sigma);
                     Threshold::Array(&self.std_img)
                 }
             }
@@ -729,7 +731,7 @@ impl Extractor {
 
         let eroded_pixels: Vec<usize> = match threshold {
             Threshold::Scalar(th) => {
-                if self.config.binary_open {
+                if options.binary_open {
                     let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
 
                     (0..chunks)
@@ -802,7 +804,7 @@ impl Extractor {
                 }
             }
             Threshold::Array(arr) => {
-                if self.config.binary_open {
+                if options.binary_open {
                     let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
 
                     (0..chunks)
@@ -885,7 +887,7 @@ impl Extractor {
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
-        if self.config.binary_open {
+        if options.binary_open {
             for &i in &eroded_pixels {
                 self.mask[i] = true;
                 self.mask[i - 1] = true;
@@ -899,7 +901,7 @@ impl Extractor {
             }
         }
 
-        let dbg_mask = if self.config.return_images {
+        let dbg_mask = if options.return_images {
             Some(Array2::from_shape_vec((height, width), self.mask.clone()).unwrap())
         } else {
             None
@@ -965,22 +967,22 @@ impl Extractor {
                 }
             }
 
-            if let Some(min_a) = self.config.min_area {
+            if let Some(min_a) = options.min_area {
                 if area < min_a {
                     continue;
                 }
             }
-            if let Some(max_a) = self.config.max_area {
+            if let Some(max_a) = options.max_area {
                 if area > max_a {
                     continue;
                 }
             }
-            if let Some(min_s) = self.config.min_sum {
+            if let Some(min_s) = options.min_sum {
                 if sum < min_s {
                     continue;
                 }
             }
-            if let Some(max_s) = self.config.max_sum {
+            if let Some(max_s) = options.max_sum {
                 if sum > max_s {
                     continue;
                 }
@@ -1002,7 +1004,7 @@ impl Extractor {
             let minor = (2.0 * 0f64.max(m2_xx + m2_yy - root)).sqrt();
             let axis_ratio = major / minor.max(1e-9);
 
-            if let Some(max_ar) = self.config.max_axis_ratio {
+            if let Some(max_ar) = options.max_axis_ratio {
                 if axis_ratio > max_ar || minor <= 0.0 {
                     continue;
                 }
@@ -1022,12 +1024,12 @@ impl Extractor {
 
         // 7. Sort
         extracted.sort_by(|a, b| b.sum.partial_cmp(&a.sum).unwrap_or(Ordering::Equal));
-        if let Some(max_ret) = self.config.max_returned {
+        if let Some(max_ret) = options.max_returned {
             extracted.truncate(max_ret);
         }
 
         // 8. Centroid Window
-        if let Some(mut window) = self.config.centroid_window {
+        if let Some(mut window) = options.centroid_window {
             window = window.min(height).min(width);
             for centroid in &mut extracted {
                 let c_x = centroid.x.floor() as isize;
@@ -1064,11 +1066,11 @@ impl Extractor {
 
         // 9. Revert effects of crop and downsample
         for centroid in &mut extracted {
-            if let Some(ds) = self.config.downsample {
+            if let Some(ds) = options.downsample {
                 centroid.x *= ds as f64;
                 centroid.y *= ds as f64;
             }
-            if self.config.crop.is_some() {
+            if options.crop.is_some() {
                 centroid.x += final_offs_w as f64;
                 centroid.y += final_offs_h as f64;
             }
@@ -1076,7 +1078,7 @@ impl Extractor {
 
         ExtractionResult {
             centroids: extracted,
-            debug_images: if self.config.return_images {
+            debug_images: if options.return_images {
                 Some(DebugImages {
                     cropped_and_downsampled: dbg_cropped.unwrap(),
                     removed_background: dbg_bg_sub.unwrap(),

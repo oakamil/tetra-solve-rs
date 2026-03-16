@@ -16,7 +16,7 @@ use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
-use tetra3::{CentroidConfig, Extractor};
+use tetra3::{ExtractOptions, Extractor};
 
 const PY_HELPER_CODE: &str = r#"
 import numpy as np
@@ -180,17 +180,18 @@ fn run_validation_suite_from_fixtures(
                         }
                     }
 
-                    let mut extractor = Extractor::new(CentroidConfig {
+                    let mut extractor = Extractor::new();
+                    let options = ExtractOptions {
                         bg_sub_mode: *bg_rs,
                         sigma_mode: *sig_rs,
                         downsample: ds_opt,
                         return_images: false,
                         ..Default::default()
-                    });
+                    };
 
                     // 2. Run Rust Algorithm
                     let start_rust = Instant::now();
-                    let rust_result = extractor.extract(&rust_input_img);
+                    let rust_result = extractor.extract(&rust_input_img, options);
                     total_rust_time += start_rust.elapsed();
 
                     // --- STABILIZE SORTING FOR TIES ---
@@ -665,11 +666,12 @@ fn test_performance_vs_python() {
     let py_ds_arg = ds_opt.unwrap_or(0);
 
     // Initialize global buffer to prevent OS allocation overhead during benchmarking
-    let mut tetra_extractor = Extractor::new(CentroidConfig {
+    let mut tetra_extractor = Extractor::new();
+    let options = ExtractOptions {
         downsample: ds_opt,
         return_images: false,
         ..Default::default()
-    });
+    };
 
     Python::with_gil(|py| {
         let module =
@@ -719,7 +721,7 @@ fn test_performance_vs_python() {
 
                 // Run Rust Algorithm (Tetra3 Port)
                 let start_rust = Instant::now();
-                let _rust_result = tetra_extractor.extract(rust_input_img);
+                let _rust_result = tetra_extractor.extract(rust_input_img, options.clone());
                 total_rust_time += start_rust.elapsed();
             }
         }
@@ -771,11 +773,12 @@ fn test_performance_vs_cedar() {
         let ds_val = ds_opt.unwrap_or(1);
         let cedar_ds = ds_opt.unwrap_or(1) as u32;
 
-        let mut tetra_extractor = Extractor::new(CentroidConfig {
+        let mut tetra_extractor = Extractor::new();
+        let options = ExtractOptions {
             downsample: ds_opt,
             return_images: false,
             ..Default::default()
-        });
+        };
 
         // Use the exact same loaded array for both algorithms to benchmark effectively
         let mut preloaded_images = Vec::new();
@@ -808,7 +811,7 @@ fn test_performance_vs_cedar() {
             for (rust_input_img, cedar_img) in &preloaded_images {
                 // Run Rust Algorithm (Tetra3 Port)
                 let start_rust = Instant::now();
-                let _rust_result = tetra_extractor.extract(rust_input_img);
+                let _rust_result = tetra_extractor.extract(rust_input_img, options.clone());
                 total_rust_time += start_rust.elapsed();
 
                 // Run Cedar Detect Algorithm

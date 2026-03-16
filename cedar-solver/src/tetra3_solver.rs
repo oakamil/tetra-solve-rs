@@ -107,8 +107,7 @@ impl SolverTrait for Tetra3Solver {
         };
 
         // Pass the properly mapped array into the solver
-        let result =
-            solver.solve_from_centroids(&centroids_array, (height as f64, width as f64), options);
+        let result = solver.solve(&centroids_array, (height as f64, width as f64), options);
 
         match result.status {
             SolveStatus::MatchFound => {

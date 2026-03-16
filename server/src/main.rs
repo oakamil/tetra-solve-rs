@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
 
-use tetra3::{extractor::CentroidConfig, extractor::Extractor, solver::Solver};
+use tetra3::{extractor::Extractor, solver::Solver};
 use tetra3_server::{Tetra3ServerImpl, proto::tetra3_service_server::Tetra3ServiceServer};
 
 #[derive(Parser, Debug)]
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let solver = Solver::load_database(&args.database_path)?;
     println!("Database loaded successfully.");
 
-    let extractor = Extractor::new(CentroidConfig::default());
+    let extractor = Extractor::new();
 
     let service = Tetra3ServerImpl {
         solver: Arc::new(Mutex::new(solver)),

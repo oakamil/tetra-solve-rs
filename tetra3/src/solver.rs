@@ -1388,7 +1388,7 @@ impl Solver {
         }
     }
 
-    pub fn solve_from_centroids(
+    pub fn solve(
         &mut self,
         star_centroids: &Array2<f64>,
         size: (f64, f64),

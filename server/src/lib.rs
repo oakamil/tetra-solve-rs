@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 use tetra3::{
-    extractor::{BgSubMode, CentroidConfig, Crop, Extractor, SigmaMode},
+    extractor::{BgSubMode, Crop, ExtractOptions, Extractor, SigmaMode},
     solver::{Solution as T3Solution, SolveOptions, SolveStatus, Solver},
 };
 
@@ -70,10 +70,10 @@ fn map_solve_options(opt: proto::SolveOptions) -> SolveOptions {
     }
 }
 
-fn map_extract_config(cfg: proto::CentroidConfig) -> CentroidConfig {
-    let def = CentroidConfig::default();
+fn map_extract_options(opt: proto::ExtractOptions) -> ExtractOptions {
+    let def = ExtractOptions::default();
 
-    let crop = cfg.crop.and_then(|c| c.crop_type).map(|ct| match ct {
+    let crop = opt.crop.and_then(|c| c.crop_type).map(|ct| match ct {
         proto::crop::CropType::Fraction(f) => Crop::Fraction(f as usize),
         proto::crop::CropType::Center(c) => Crop::Center {
             height: c.height as usize,
@@ -87,7 +87,7 @@ fn map_extract_config(cfg: proto::CentroidConfig) -> CentroidConfig {
         },
     });
 
-    let bg_sub_mode = match cfg.bg_sub_mode {
+    let bg_sub_mode = match opt.bg_sub_mode {
         Some(0) => Some(BgSubMode::LocalMedian),
         Some(1) => Some(BgSubMode::LocalMean),
         Some(2) => Some(BgSubMode::GlobalMedian),
@@ -95,7 +95,7 @@ fn map_extract_config(cfg: proto::CentroidConfig) -> CentroidConfig {
         _ => def.bg_sub_mode, // Fallback to None or default if not provided
     };
 
-    let sigma_mode = match cfg.sigma_mode {
+    let sigma_mode = match opt.sigma_mode {
         Some(0) => SigmaMode::LocalMedianAbs,
         Some(1) => SigmaMode::LocalRootSquare,
         Some(2) => SigmaMode::GlobalMedianAbs,
@@ -103,26 +103,26 @@ fn map_extract_config(cfg: proto::CentroidConfig) -> CentroidConfig {
         _ => def.sigma_mode, // Fallback to default
     };
 
-    CentroidConfig {
-        sigma: cfg.sigma.unwrap_or(def.sigma),
-        image_th: cfg.image_th.or(def.image_th),
+    ExtractOptions {
+        sigma: opt.sigma.unwrap_or(def.sigma),
+        image_th: opt.image_th.or(def.image_th),
         crop,
-        downsample: cfg.downsample.map(|v| v as usize).or(def.downsample),
-        filtsize: cfg.filtsize.map(|v| v as usize).unwrap_or(def.filtsize),
+        downsample: opt.downsample.map(|v| v as usize).or(def.downsample),
+        filtsize: opt.filtsize.map(|v| v as usize).unwrap_or(def.filtsize),
         bg_sub_mode,
         sigma_mode,
-        binary_open: cfg.binary_open.unwrap_or(def.binary_open),
-        centroid_window: cfg
+        binary_open: opt.binary_open.unwrap_or(def.binary_open),
+        centroid_window: opt
             .centroid_window
             .map(|v| v as usize)
             .or(def.centroid_window),
-        max_area: cfg.max_area.map(|v| v as usize).or(def.max_area),
-        min_area: cfg.min_area.map(|v| v as usize).or(def.min_area),
-        max_sum: cfg.max_sum.or(def.max_sum),
-        min_sum: cfg.min_sum.or(def.min_sum),
-        max_axis_ratio: cfg.max_axis_ratio.or(def.max_axis_ratio),
-        max_returned: cfg.max_returned.map(|v| v as usize).or(def.max_returned),
-        return_images: cfg.return_images.unwrap_or(def.return_images),
+        max_area: opt.max_area.map(|v| v as usize).or(def.max_area),
+        min_area: opt.min_area.map(|v| v as usize).or(def.min_area),
+        max_sum: opt.max_sum.or(def.max_sum),
+        min_sum: opt.min_sum.or(def.min_sum),
+        max_axis_ratio: opt.max_axis_ratio.or(def.max_axis_ratio),
+        max_returned: opt.max_returned.map(|v| v as usize).or(def.max_returned),
+        return_images: opt.return_images.unwrap_or(def.return_images),
     }
 }
 
@@ -221,6 +221,7 @@ fn process_shmem_extract(
     shmem_name: &str,
     width: usize,
     height: usize,
+    options: ExtractOptions,
 ) -> Result<(tetra3::extractor::ExtractionResult, f64), Status> {
     let shmem = ShmemConf::new()
         .os_id(shmem_name)
@@ -239,7 +240,7 @@ fn process_shmem_extract(
         .map_err(|e| Status::internal(format!("Failed to create ndarray view: {}", e)))?;
 
     let t0 = std::time::Instant::now();
-    let result = extractor.extract(&view);
+    let result = extractor.extract(&view, options);
     let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
 
     Ok((result, elapsed))
@@ -264,7 +265,7 @@ impl Tetra3Service for Tetra3ServerImpl {
         }
 
         let mut solver = self.solver.lock().await;
-        let solution = solver.solve_from_centroids(
+        let solution = solver.solve(
             &centroids_arr,
             (req.image_height as f64, req.image_width as f64),
             t3_opts,
@@ -281,16 +282,17 @@ impl Tetra3Service for Tetra3ServerImpl {
         let image = req
             .image
             .ok_or_else(|| Status::invalid_argument("Missing image payload"))?;
-        let config = req.config.unwrap_or_default();
+        let opt = req.options.unwrap_or_default();
 
         let mut extractor = self.extractor.lock().await;
-        extractor.config = map_extract_config(config);
+        let options = map_extract_options(opt);
 
         let (result, elapsed) = process_shmem_extract(
             &mut extractor,
             &image.shmem_name,
             image.width as usize,
             image.height as usize,
+            options,
         )?;
 
         let proto_centroids = result
@@ -326,14 +328,13 @@ impl Tetra3Service for Tetra3ServerImpl {
         // 1. Extract
         let (extracted_centroids, ext_elapsed) = {
             let mut extractor = self.extractor.lock().await;
-            if let Some(cfg) = req.extract_config {
-                extractor.config = map_extract_config(cfg);
-            }
+            let options = map_extract_options(req.extract_options.unwrap_or_default());
             let (result, elapsed) = process_shmem_extract(
                 &mut extractor,
                 &image.shmem_name,
                 image.width as usize,
                 image.height as usize,
+                options,
             )?;
             (result.centroids, elapsed)
         };
@@ -348,7 +349,7 @@ impl Tetra3Service for Tetra3ServerImpl {
         let t3_opts = req.solve_options.map(map_solve_options).unwrap_or_default();
 
         let mut solver = self.solver.lock().await;
-        let solution = solver.solve_from_centroids(
+        let solution = solver.solve(
             &centroids_arr,
             (image.height as f64, image.width as f64),
             t3_opts,

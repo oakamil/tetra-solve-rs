@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tonic::transport::Server;
 
-use tetra3::{extractor::CentroidConfig as T3CentroidConfig, extractor::Extractor, solver::Solver};
+use tetra3::{extractor::Extractor, solver::Solver};
 use tetra3_server::{
     Tetra3ServerImpl,
     proto::{
-        CentroidConfig, ExtractRequest, ImageInput, Pixel, SolveFromImageRequest, SolveOptions,
+        ExtractOptions, ExtractRequest, ImageInput, Pixel, SolveFromImageRequest, SolveOptions,
         SolveRequest, tetra3_service_client::Tetra3ServiceClient,
         tetra3_service_server::Tetra3ServiceServer,
     },
@@ -34,7 +34,7 @@ async fn test_solve_from_image_batch() -> Result<(), Box<dyn std::error::Error>>
 
     // 2. Start the gRPC server in the background
     let solver = Solver::load_database(&db_path).expect("Failed to load solver database");
-    let extractor = Extractor::new(T3CentroidConfig::default());
+    let extractor = Extractor::new();
 
     let service = Tetra3ServerImpl {
         solver: Arc::new(Mutex::new(solver)),
@@ -108,14 +108,14 @@ async fn test_solve_from_image_batch() -> Result<(), Box<dyn std::error::Error>>
             );
         }
 
-        // Build the request using default configs
+        // Build the request using default options
         let request = tonic::Request::new(SolveFromImageRequest {
             image: Some(ImageInput {
                 shmem_name: shmem_name.clone(),
                 width,
                 height,
             }),
-            extract_config: Some(CentroidConfig::default()),
+            extract_options: Some(ExtractOptions::default()),
             solve_options: Some(SolveOptions::default()),
         });
 
@@ -174,7 +174,7 @@ async fn test_extract_then_solve() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Start the gRPC server in the background
     let solver = Solver::load_database(&db_path).expect("Failed to load solver database");
-    let extractor = Extractor::new(T3CentroidConfig::default());
+    let extractor = Extractor::new();
 
     let service = Tetra3ServerImpl {
         solver: Arc::new(Mutex::new(solver)),
@@ -252,7 +252,7 @@ async fn test_extract_then_solve() -> Result<(), Box<dyn std::error::Error>> {
                 width,
                 height,
             }),
-            config: Some(CentroidConfig::default()),
+            options: Some(ExtractOptions::default()),
         });
 
         let extract_response = client.extract(extract_request).await?.into_inner();
