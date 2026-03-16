@@ -86,9 +86,7 @@ pub struct PyImageResult {
 
 /// Helper function to locate and return the test images, maximizing code reuse across tests.
 fn get_test_images() -> Vec<PathBuf> {
-    // Assuming this test runs from the `tetra3` crate root, and `cedar-solve`
-    // is cloned adjacent to the parent directory.
-    let test_dir = "../../cedar-solve/examples/data/medium_fov";
+    let test_dir = "tests/fixtures/sample_images";
     let mut image_paths = Vec::new();
 
     if Path::new(test_dir).exists() {
@@ -105,7 +103,7 @@ fn get_test_images() -> Vec<PathBuf> {
 
     assert!(
         !image_paths.is_empty(),
-        "No test images found in {}! Ensure cedar-solve is cloned in the correct relative location.",
+        "No test images found in {}!",
         test_dir
     );
 
@@ -493,7 +491,9 @@ fn test_extraction_against_python_full() {
 }
 
 #[test]
-#[ignore] // Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored
+#[ignore]
+// Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored
+// This test requires the tetra3 module to be loaded in the Python environment
 fn generate_python_test_fixtures() {
     let bg_modes = [
         (
@@ -654,6 +654,8 @@ fn generate_python_test_fixtures() {
 
 #[test]
 #[ignore]
+// Run intentionally via: cargo test test_performance_vs_python --release -- --ignored
+// This test requires the tetra3 module to be loaded in the Python environment
 fn test_performance_vs_python() {
     let mut total_rust_time = Duration::ZERO;
     let mut total_py_time = Duration::ZERO;

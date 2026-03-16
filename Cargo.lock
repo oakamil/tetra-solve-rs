@@ -475,6 +475,8 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "serde",
+ "serde_json",
  "tetra3",
  "tetra3_server",
  "tokio",
