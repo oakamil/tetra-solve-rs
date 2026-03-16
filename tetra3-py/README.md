@@ -15,6 +15,8 @@ To compile the bindings from source, you will need:
 
 It is highly recommended to build and install this package inside a Python virtual environment.
 
+**⚠️ Important Build Note:** You *must* pass `--features pyo3/extension-module` when building with Maturin. This feature is strictly opt-in to prevent the Python C-API linker from breaking standard `cargo test` runs in the broader Rust workspace, but it is required for Python to recognize the compiled `.so` file as an importable module.
+
 ### 1. Local Development (Testing)
 To compile the library and immediately install it into your active virtual environment, run:
 ```bash
@@ -58,12 +60,13 @@ img_arr = np.asarray(img, dtype=np.float32)
 result = t3.solve_from_image(
     img_arr, 
     fov_estimate=11.4, 
-    downsample=2
+    downsample=2,
+    return_images=True # Passes debug images back to Python zero-copy!
 )
 
 # Print results
 if result.get("ra") is not None:
-    print(f"Match Found!")
+    print("Match Found!")
     print(f"RA:  {result['ra']:.4f}")
     print(f"Dec: {result['dec']:.4f}")
     print(f"Solve Time: {result['t_solve_ms']:.2f} ms")
@@ -81,13 +84,26 @@ Creates a new Tetra3 solver instance.
 
 Extracts stars from the image.
 
-* **Returns:** A dictionary containing a single N x 4 NumPy array under the key `'centroids'`. The columns correspond to `[y, x, sum, area]`.
+* **Arguments:** * `image`: A 2D float32 NumPy array.
+* `**kwargs`: Supports `sigma`, `downsample`, `min_area`, `max_area`, `min_sum`, `max_sum`, `max_axis_ratio`, `bg_sub_mode` (string), `sigma_mode` (string), `return_images` (bool), and `return_moments` (bool).
+
+
+* **Returns:** A dictionary containing:
+* `'centroids'`: A single N x 4 NumPy array `[y, x, sum, area]`. If `return_moments=True` is passed, this expands to an N x 8 array including `[..., m2_xx, m2_yy, m2_xy, axis_ratio]`.
+* `'image_bg_subtracted'` / `'image_thresholded'`: Zero-copy NumPy arrays if `return_images=True` was passed.
+
+
 
 ### `solve_from_image(image: np.ndarray, **kwargs) -> dict`
 
 Runs the complete extraction and plate solving pipeline.
 
-* **Returns:** A dictionary containing the solution: `'ra'`, `'dec'`, `'roll'`, `'fov'`, `'t_extract_ms'`, `'t_solve_ms'`, and optionally `'rotation_matrix'`.
+* **Arguments:**
+* `image`: A 2D float32 NumPy array.
+* `**kwargs`: Accepts all extraction arguments above, plus solver constraints like `fov_estimate`, `match_radius`, `verify_min_matches`, etc.
+
+
+* **Returns:** A dictionary containing the solution: `'ra'`, `'dec'`, `'roll'`, `'fov'`, `'t_extract_ms'`, `'t_solve_ms'`, and optionally `'rotation_matrix'`. Also returns debug images if `return_images=True` was passed.
 
 ---
 
