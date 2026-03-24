@@ -1764,6 +1764,10 @@ impl Solver {
         }
         // -------------------------------------------------------------
         // FALLBACK PATH: Non-standard p_size (!= 4)
+        //
+        // We should never hit this (there's a reason the original was named
+        // "tetra"), but it's kept here to maintain parity with the Python
+        // implementation.
         // -------------------------------------------------------------
         else {
             for image_pattern_indices in breadth_first_combinations(&pattern_centroids_inds, p_size)

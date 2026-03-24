@@ -1,6 +1,6 @@
-# Tetra3 Solver in Rust
+# Olive Solve - Tetra3 Solver in Rust
 
-A fast, robust, and async-friendly Rust implementation of the [cedar-solve](https://github.com/smroid/cedar-solve) centroid extraction and plate solving algorithms. 
+A fast, robust, and async-friendly Rust implementation and optimization of the [cedar-solve](https://github.com/smroid/cedar-solve) centroid extraction and plate solving algorithms. 
 
 ## Repository Structure
 
@@ -13,7 +13,7 @@ This workspace is divided into two primary crates:
 ## Getting Started
 
 ### Prerequisites
-* [Rust / Cargo](https://rustup.rs/) (edition 2021)
+* [Rust / Cargo](https://rustup.rs/)
 * Python 3
 
 ### Building
@@ -104,6 +104,6 @@ See LICENSE.md for full details.
 
 All product names, trademarks and registered trademarks are property of their respective owners. All company, product and service names used in this website are for identification purposes only. Use of these names, trademarks and brands does not imply endorsement.
 
-`tetra-solve-rs` is not affiliated with, endorsed by, or sponsored by Clear Skies Astro or the European Space Agency.
+`olive-solve` is not affiliated with, endorsed by, or sponsored by Clear Skies Astro or the European Space Agency.
 
 Cedar™ is a trademark of Clear Skies Astro, registered in the U.S. and other countries.

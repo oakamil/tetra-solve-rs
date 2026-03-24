@@ -1,4 +1,4 @@
-# License for `tetra-solve-rs`
+# License for `olive-solve`
 
 This software is dual-licensed depending on your use case:
 
