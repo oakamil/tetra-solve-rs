@@ -106,6 +106,55 @@ impl PyTetra3 {
         Ok(out_dict)
     }
 
+    /// Runs plate solving from pre-extracted centroids.
+    /// Returns a dictionary containing the solution and execution times.
+    #[pyo3(signature = (centroids, size, **kwargs))]
+    fn solve_from_centroids<'py>(
+        &mut self,
+        py: Python<'py>,
+        centroids: PyReadonlyArray2<'py, f64>,
+        size: (f64, f64),
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let solve_options = parse_solve_options(kwargs)?;
+
+        // Convert the borrowed view into an owned array for the core solver
+        let cent_owned = centroids.as_array().to_owned();
+
+        // Run the native Rust solve pipeline, skipping extraction
+        let solution = self
+            .inner
+            .solve_from_centroids(&cent_owned, size, solve_options) // 3. Pass the owned array
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Map the new Solution structure to a Python Dict
+        let out_dict = PyDict::new(py);
+        out_dict.set_item("ra", solution.ra)?;
+        out_dict.set_item("dec", solution.dec)?;
+        out_dict.set_item("roll", solution.roll)?;
+        out_dict.set_item("fov", solution.fov)?;
+
+        out_dict.set_item("distortion", solution.distortion)?;
+        out_dict.set_item("rmse", solution.rmse)?;
+        out_dict.set_item("prob", solution.prob)?;
+        out_dict.set_item("matches", solution.matches)?;
+
+        out_dict.set_item("t_extract_ms", 0.0)?; // Explicitly 0 since no extraction occurred
+        out_dict.set_item("t_solve_ms", solution.t_solve_ms)?;
+
+        if let Some(rm) = solution.rotation_matrix {
+            let flat_slice = rm.as_slice().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Matrix not contiguous")
+            })?;
+            let py_matrix = numpy::PyArray1::from_slice(py, flat_slice)
+                .reshape([3, 3])
+                .unwrap();
+            out_dict.set_item("rotation_matrix", py_matrix)?;
+        }
+
+        Ok(out_dict)
+    }
+
     /// Runs extraction and plate solving in one uninterrupted pipeline.
     /// Returns a dictionary containing the solution and execution times.
     #[pyo3(signature = (image, **kwargs))]
@@ -355,6 +404,60 @@ def run_benchmark(db_path, img_dir):
     print("-" * 105 + "\n")
 "#;
 
+    const PYTHON_SPLIT_EXAMPLE_CODE: &std::ffi::CStr = cr#"
+import os
+import time
+import glob
+import numpy as np
+from PIL import Image
+
+import tetra3 
+
+def run_benchmark_split(db_path, img_dir):
+    if not os.path.exists(db_path):
+        return
+    if not os.path.exists(img_dir):
+        return
+
+    print(f"\n{'Filename':<40} | {'RA':<8} | {'Dec':<8} | {'Extract (ms)':<12} | {'Solve (ms)':<12} | {'Total Inv (ms)':<14}")
+    print("-" * 105)
+
+    t3 = tetra3.Tetra3(db_path)
+    search_pattern = os.path.join(img_dir, "*.jpg")
+    image_files = sorted(glob.glob(search_pattern))
+
+    for img_path in image_files:
+        filename = os.path.basename(img_path)
+        img = Image.open(img_path).convert('L')
+        img_arr = np.asarray(img, dtype=np.float32)
+        img_size = (img_arr.shape[0], img_arr.shape[1])
+        
+        t0 = time.perf_counter()
+        
+        # Step 1: Extract centroids
+        ext_dict = t3.get_centroids_from_image(img_arr)
+        centroids = ext_dict["centroids"]
+        
+        t1 = time.perf_counter()
+        ext_ms = (t1 - t0) * 1000.0
+        
+        # Step 2: Solve from extracted centroids
+        result = t3.solve_from_centroids(centroids, img_size)
+        
+        inv_time_ms = (time.perf_counter() - t0) * 1000.0
+
+        ra = result.get("ra")
+        dec = result.get("dec")
+        solve_ms = result.get("t_solve_ms", 0.0)
+
+        ra_str = f"{ra:.3f}" if ra is not None else "N/A"
+        dec_str = f"{dec:.3f}" if dec is not None else "N/A"
+
+        print(f"{filename:<40.40} | {ra_str:<8} | {dec_str:<8} | {ext_ms:<12.2f} | {solve_ms:<12.2f} | {inv_time_ms:<14.2f}")
+
+    print("-" * 105 + "\n")
+"#;
+
     #[test]
     #[ignore]
     fn test_python_wrapper_from_python_script() {
@@ -384,6 +487,44 @@ def run_benchmark(db_path, img_dir):
 
             // 4. Run it
             let run_benchmark = main_mod.getattr("run_benchmark").unwrap();
+            run_benchmark.call1((db_path, img_dir)).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn test_python_wrapper_split_pipeline() {
+        let db_path = "../tetra3/tests/fixtures/default_database.npz";
+        let img_dir = "../tetra3/tests/fixtures/sample_images";
+
+        if !Path::new(db_path).exists() || !Path::new(img_dir).exists() {
+            return; // Skip gracefully if data isn't present
+        }
+
+        Python::initialize();
+        Python::attach(|py| {
+            // 1. Manually build the `tetra3` module
+            let tetra3_mod = PyModule::new(py, "tetra3").unwrap();
+            tetra3_mod.add_class::<PyTetra3>().unwrap();
+
+            // 2. Inject the module into Python's `sys.modules`
+            let sys = py.import("sys").unwrap();
+            sys.getattr("modules")
+                .unwrap()
+                .set_item("tetra3", tetra3_mod)
+                .unwrap();
+
+            // 3. Compile and load the newly split embedded script
+            let main_mod = PyModule::from_code(
+                py,
+                PYTHON_SPLIT_EXAMPLE_CODE,
+                c"example_split.py",
+                c"example_split",
+            )
+            .unwrap();
+
+            // 4. Run the newly added benchmark
+            let run_benchmark = main_mod.getattr("run_benchmark_split").unwrap();
             run_benchmark.call1((db_path, img_dir)).unwrap();
         });
     }

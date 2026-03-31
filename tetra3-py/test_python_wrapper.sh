@@ -43,7 +43,7 @@ echo "  Running Rust/Python Integration Test        "
 echo "=============================================="
 # This runs the specific test we just wrote, ensuring the Python runtime
 # uses the .env we just populated with the tetra3 module.
-cargo test test_python_wrapper --release -- --ignored --nocapture
+cargo test test_python_wrapper --release -- --ignored --nocapture --test-threads 1
 
 echo "=============================================="
 echo "  Success!                                    "
