@@ -914,6 +914,7 @@ fn test_performance_vs_cedar() {
     for &ds_opt in &downsamples {
         let mut total_rust_time = Duration::ZERO;
         let mut total_rust_u8_time = Duration::ZERO;
+        let mut total_rust_fast_u8_time = Duration::ZERO;
         let mut total_cedar_time = Duration::ZERO;
 
         let ds_val = ds_opt.unwrap_or(1);
@@ -957,15 +958,24 @@ fn test_performance_vs_cedar() {
 
         for _ in 0..iterations {
             for (rust_input_img, rust_input_img_u8, cedar_img) in &preloaded_images {
-                // Run Rust Algorithm (Tetra3 Port)
+                // Run Rust Algorithm (Tetra3 Port f32)
                 let start_rust = Instant::now();
                 let _rust_result = tetra_extractor.extract(rust_input_img, options.clone());
                 total_rust_time += start_rust.elapsed();
 
+                // Run Rust Algorithm (Tetra3 Port u8)
                 let start_rust_u8 = Instant::now();
                 let _rust_result_u8 =
                     tetra_extractor.extract_u8(rust_input_img_u8, options.clone());
                 total_rust_u8_time += start_rust_u8.elapsed();
+
+                // Run Rust Algorithm for 1x Only (Tetra3 Port Fast u8)
+                if ds_opt == None {
+                    let start_rust_fast_u8 = Instant::now();
+                    let _rust_result_fast_u8 =
+                        tetra_extractor.extract_u8_fast(rust_input_img_u8, options.clone());
+                    total_rust_fast_u8_time += start_rust_fast_u8.elapsed();
+                }
 
                 // Run Cedar Detect Algorithm
                 let start_cedar = Instant::now();
@@ -1012,6 +1022,19 @@ fn test_performance_vs_cedar() {
                 total_rust_u8_time / image_count as u32
             );
         }
+        if ds_opt == None {
+            println!("----------------------------------------------");
+            println!(
+                "Rust (Fast u8) Total Time  : {:.2?}",
+                total_rust_fast_u8_time
+            );
+            if image_count > 0 {
+                println!(
+                    "Rust (Fast u8) Avg/Image   : {:.2?}",
+                    total_rust_fast_u8_time / image_count as u32
+                );
+            }
+        }
         println!("----------------------------------------------");
         println!("Rust (CedarDetect) Total   : {:.2?}", total_cedar_time);
         if image_count > 0 {
@@ -1025,6 +1048,21 @@ fn test_performance_vs_cedar() {
         println!("Port Speedup vs Cedar      : {:.2}x", speedup);
         println!("==============================================\n");
     }
+}
+
+// Struct to hold processed results to easily print two distinct tables
+struct TableRow {
+    img_name: String,
+    port_u8_count: usize,
+    port_f32_count: usize,
+    fast_u8_count: usize,
+    cedar_count: usize,
+    match_str_u8: String,
+    match_str_fast_u8: String,
+    u8_solve_str: String,
+    fast_u8_solve_str: String,
+    cedar_solve_str: String,
+    orig_f32_solve_str: String,
 }
 
 #[test]
@@ -1045,12 +1083,64 @@ fn test_grayscale_vs_cedar() {
         ..Default::default()
     };
 
-    println!(
-        "
-{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<25} | {:<25}",
-        "Image", "Olive u8", "Olive f32", "Cedar", "Top 4 Match", "u8 Solved", "Cedar Solved"
-    );
-    println!("{}", "-".repeat(150));
+    let mut table_rows = Vec::new();
+
+    // Macros bypass the need for explicit type signatures, fixing compilation errors
+    // for types that are nested or not exported in the root namespace.
+    macro_rules! format_solve {
+        ($res:expr) => {
+            if $res.status == SolveStatus::MatchFound {
+                format!(
+                    "{:.3}, {:.3}, {:.3}",
+                    $res.ra.unwrap(),
+                    $res.dec.unwrap(),
+                    $res.roll.unwrap()
+                )
+            } else {
+                "None".to_string()
+            }
+        };
+    }
+
+    macro_rules! to_array {
+        ($cents:expr, $y:ident, $x:ident) => {{
+            let mut flat = Vec::with_capacity($cents.len() * 2);
+            for c in $cents {
+                flat.push(c.$y as f64);
+                flat.push(c.$x as f64);
+            }
+            Array2::from_shape_vec(($cents.len(), 2), flat).unwrap()
+        }};
+    }
+
+    macro_rules! compare_top4 {
+        ($olive:expr, $cedar:expr) => {{
+            let mut match_top4 = true;
+            let eps = 2.0; // Distance tolerance
+            let compare_len = 4.min($olive.len()).min($cedar.len());
+            if ($olive.len() < 4 || $cedar.len() < 4) && $olive.len() != $cedar.len() {
+                match_top4 = false;
+            }
+            for i in 0..compare_len {
+                let p = &$olive[i];
+                let c = &$cedar[i];
+                let dist = ((p.x - c.centroid_x as f64).powi(2)
+                    + (p.y - c.centroid_y as f64).powi(2))
+                .sqrt();
+                if dist > eps {
+                    match_top4 = false;
+                    break;
+                }
+            }
+            if match_top4 && compare_len > 0 {
+                "YES".to_string()
+            } else if compare_len == 0 && $olive.len() == $cedar.len() {
+                "YES (0)".to_string()
+            } else {
+                "NO".to_string()
+            }
+        }};
+    }
 
     for path in &image_paths {
         let img_name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -1068,13 +1158,17 @@ fn test_grayscale_vs_cedar() {
             }
         }
 
-        // Run Olive u8
-        let olive_u8_result = tetra_extractor.extract_u8(&rust_input_img_u8, options.clone());
-        let olive_u8_count = olive_u8_result.centroids.len();
+        // Run Port u8
+        let port_u8_result = tetra_extractor.extract_u8(&rust_input_img_u8, options.clone());
+        let port_u8_count = port_u8_result.centroids.len();
 
-        // Run Olive f32
-        let olive_f32_result = tetra_extractor.extract(&rust_input_img_f32, options.clone());
-        let olive_f32_count = olive_f32_result.centroids.len();
+        // Run Fast u8
+        let fast_u8_result = tetra_extractor.extract_u8_fast(&rust_input_img_u8, options.clone());
+        let fast_u8_count = fast_u8_result.centroids.len();
+
+        // Run Port f32 (Original f32)
+        let port_f32_result = tetra_extractor.extract(&rust_input_img_f32, options.clone());
+        let port_f32_count = port_f32_result.centroids.len();
 
         // Run Cedar Detect
         let noise_estimate = estimate_noise_from_image(&luma_img);
@@ -1089,86 +1183,97 @@ fn test_grayscale_vs_cedar() {
         );
         let cedar_count = cedar_result.0.len();
 
-        // Solve Olive u8
-        let mut u8_cents_flat = Vec::with_capacity(olive_u8_count * 2);
-        for c in &olive_u8_result.centroids {
-            u8_cents_flat.push(c.y);
-            u8_cents_flat.push(c.x);
-        }
-        let u8_cents_arr = Array2::from_shape_vec((olive_u8_count, 2), u8_cents_flat).unwrap();
+        // Solve Port u8
+        let u8_cents_arr = to_array!(&port_u8_result.centroids, y, x);
         let u8_solve_res =
             solver.solve(&u8_cents_arr, (h as f64, w as f64), SolveOptions::default());
-        let u8_solve_str = if u8_solve_res.status == SolveStatus::MatchFound {
-            format!(
-                "{:.3}, {:.3}, {:.3}",
-                u8_solve_res.ra.unwrap(),
-                u8_solve_res.dec.unwrap(),
-                u8_solve_res.roll.unwrap()
-            )
-        } else {
-            "None".to_string()
-        };
+        let u8_solve_str = format_solve!(u8_solve_res);
+
+        // Solve Fast u8
+        let fast_u8_cents_arr = to_array!(&fast_u8_result.centroids, y, x);
+        let fast_u8_solve_res = solver.solve(
+            &fast_u8_cents_arr,
+            (h as f64, w as f64),
+            SolveOptions::default(),
+        );
+        let fast_u8_solve_str = format_solve!(fast_u8_solve_res);
 
         // Solve Cedar
-        let mut cedar_cents_flat = Vec::with_capacity(cedar_count * 2);
-        for c in &cedar_result.0 {
-            cedar_cents_flat.push(c.centroid_y as f64);
-            cedar_cents_flat.push(c.centroid_x as f64);
-        }
-        let cedar_cents_arr = Array2::from_shape_vec((cedar_count, 2), cedar_cents_flat).unwrap();
+        let cedar_cents_arr = to_array!(&cedar_result.0, centroid_y, centroid_x);
         let cedar_solve_res = solver.solve(
             &cedar_cents_arr,
             (h as f64, w as f64),
             SolveOptions::default(),
         );
-        let cedar_solve_str = if cedar_solve_res.status == SolveStatus::MatchFound {
-            format!(
-                "{:.3}, {:.3}, {:.3}",
-                cedar_solve_res.ra.unwrap(),
-                cedar_solve_res.dec.unwrap(),
-                cedar_solve_res.roll.unwrap()
-            )
-        } else {
-            "None".to_string()
-        };
+        let cedar_solve_str = format_solve!(cedar_solve_res);
 
-        // Compare top 4 (Olive u8 vs Cedar)
-        let mut match_top4 = true;
-        let eps = 2.0; // Distance tolerance
+        // Solve Original f32
+        let orig_f32_cents_arr = to_array!(&port_f32_result.centroids, y, x);
+        let orig_f32_solve_res = solver.solve(
+            &orig_f32_cents_arr,
+            (h as f64, w as f64),
+            SolveOptions::default(),
+        );
+        let orig_f32_solve_str = format_solve!(orig_f32_solve_res);
 
-        let compare_len = 4.min(olive_u8_count).min(cedar_count);
-        if (olive_u8_count < 4 || cedar_count < 4) && olive_u8_count != cedar_count {
-            match_top4 = false;
-        }
+        // Calculate top 4 Matches against Cedar
+        let match_str_u8 = compare_top4!(&port_u8_result.centroids, &cedar_result.0);
+        let match_str_fast_u8 = compare_top4!(&fast_u8_result.centroids, &cedar_result.0);
 
-        for i in 0..compare_len {
-            let p = &olive_u8_result.centroids[i];
-            let c = &cedar_result.0[i];
-
-            let dist =
-                ((p.x - c.centroid_x as f64).powi(2) + (p.y - c.centroid_y as f64).powi(2)).sqrt();
-            if dist > eps {
-                match_top4 = false;
-                break;
-            }
-        }
-
-        let match_str = if match_top4 && compare_len > 0 {
-            "YES"
-        } else if compare_len == 0 && olive_u8_count == cedar_count {
-            "YES (0)"
-        } else {
-            "NO"
-        };
-        println!(
-            "{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<25} | {:<25}",
+        table_rows.push(TableRow {
             img_name,
-            olive_u8_count,
-            olive_f32_count,
+            port_u8_count,
+            port_f32_count,
+            fast_u8_count,
             cedar_count,
-            match_str,
+            match_str_u8,
+            match_str_fast_u8,
             u8_solve_str,
-            cedar_solve_str
+            fast_u8_solve_str,
+            cedar_solve_str,
+            orig_f32_solve_str,
+        });
+    }
+
+    println!(
+        "\n{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<18} | {:<22}",
+        "Image",
+        "Port u8",
+        "Port f32",
+        "Fast u8",
+        "Cedar",
+        "Top 4 Match (u8)",
+        "Top 4 Match (Fast u8)"
+    );
+    println!("{}", "-".repeat(140));
+
+    for row in &table_rows {
+        println!(
+            "{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<18} | {:<22}",
+            row.img_name,
+            row.port_u8_count,
+            row.port_f32_count,
+            row.fast_u8_count,
+            row.cedar_count,
+            row.match_str_u8,
+            row.match_str_fast_u8
+        );
+    }
+
+    println!(
+        "\n\n{:<40} | {:<22} | {:<22} | {:<22} | {:<22}",
+        "Image", "Port u8 Solved", "Fast u8 Solved", "Cedar Solved", "Original f32 Solved"
+    );
+    println!("{}", "-".repeat(140));
+
+    for row in &table_rows {
+        println!(
+            "{:<40} | {:<22} | {:<22} | {:<22} | {:<22}",
+            row.img_name,
+            row.u8_solve_str,
+            row.fast_u8_solve_str,
+            row.cedar_solve_str,
+            row.orig_f32_solve_str
         );
     }
     println!();
