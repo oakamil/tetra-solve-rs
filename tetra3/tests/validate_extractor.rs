@@ -1559,9 +1559,12 @@ struct ExtractorComparisonRow {
     local_median_time: std::time::Duration,
     fast_extractor_count: usize,
     fast_extractor_time: std::time::Duration,
+    block_median_count: usize,
+    block_median_time: std::time::Duration,
     global_solve_str: String,
     local_solve_str: String,
     fast_solve_str: String,
+    block_solve_str: String,
 }
 
 #[test]
@@ -1654,6 +1657,18 @@ fn test_fast_extractor_vs_others() {
         let fast_extractor_time = t0.elapsed();
         let fast_extractor_count = res_fast.len();
 
+        // Fast Extractor with Block Median
+        let opt_block = FastExtractOptions {
+            downsample: FastDownsample::None,
+            bg_sub_mode: Some(FastBgSubMode::BlockMedian { block_size: 64 }),
+            ..Default::default()
+        };
+        let mut block_extractor = FastExtractor::new(w as usize, h as usize, opt_block);
+        let t0 = std::time::Instant::now();
+        let res_block = block_extractor.extract(&rust_input_img_u8);
+        let block_median_time = t0.elapsed();
+        let block_median_count = res_block.len();
+
         let global_cents_arr = to_array!(&res_global.centroids, y, x);
         let global_solve_res = solver.solve(
             &global_cents_arr,
@@ -1678,6 +1693,14 @@ fn test_fast_extractor_vs_others() {
         );
         let fast_solve_str = format_solve!(fast_solve_res);
 
+        let block_cents_arr = to_array!(&res_block, y, x);
+        let block_solve_res = solver.solve(
+            &block_cents_arr,
+            (h as f64, w as f64),
+            tetra3::solver::SolveOptions::default(),
+        );
+        let block_solve_str = format_solve!(block_solve_res);
+
         table_rows.push(ExtractorComparisonRow {
             img_name,
             global_median_count,
@@ -1686,47 +1709,58 @@ fn test_fast_extractor_vs_others() {
             local_median_time,
             fast_extractor_count,
             fast_extractor_time,
+            block_median_count,
+            block_median_time,
             global_solve_str,
             local_solve_str,
             fast_solve_str,
+            block_solve_str,
         });
     }
 
     println!(
-        "\n{:<40} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15}",
+        "\n{:<40} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15}",
         "Image",
         "Global Count",
         "Global Time",
         "Local Count",
         "Local Time",
         "Fast Count",
-        "Fast Time"
+        "Fast Time",
+        "Block Count",
+        "Block Time",
     );
-    println!("{}", "-".repeat(145));
+    println!("{}", "-".repeat(180));
 
     for row in &table_rows {
         println!(
-            "{:<40} | {:<15} | {:<15?} | {:<15} | {:<15?} | {:<15} | {:<15?}",
+            "{:<40} | {:<15} | {:<15?} | {:<15} | {:<15?} | {:<15} | {:<15?} | {:<15} | {:<15?}",
             row.img_name,
             row.global_median_count,
             row.global_median_time,
             row.local_median_count,
             row.local_median_time,
             row.fast_extractor_count,
-            row.fast_extractor_time
+            row.fast_extractor_time,
+            row.block_median_count,
+            row.block_median_time,
         );
     }
 
     println!(
-        "\n{:<40} | {:<30} | {:<30} | {:<30}",
-        "Image", "Global Solved", "Local Solved", "Fast Solved"
+        "\n{:<40} | {:<30} | {:<30} | {:<30} | {:<30}",
+        "Image", "Global Solved", "Local Solved", "Fast Solved", "Block Solved"
     );
-    println!("{}", "-".repeat(140));
+    println!("{}", "-".repeat(173));
 
     for row in &table_rows {
         println!(
-            "{:<40} | {:<30} | {:<30} | {:<30}",
-            row.img_name, row.global_solve_str, row.local_solve_str, row.fast_solve_str
+            "{:<40} | {:<30} | {:<30} | {:<30} | {:<30}",
+            row.img_name,
+            row.global_solve_str,
+            row.local_solve_str,
+            row.fast_solve_str,
+            row.block_solve_str
         );
     }
     println!();

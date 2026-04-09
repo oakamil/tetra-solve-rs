@@ -143,6 +143,11 @@ pub struct FastExtractor {
     bg_gy1: Vec<usize>,
     bg_ty: Vec<f32>,
 
+    // Pre-calculated weights for Centroid Window calculation
+    cw_wx: Vec<f64>,
+    cw_wy: Vec<f64>,
+    cw_strides: Vec<usize>,
+
     // Morphological & Centroiding buffers
     mask: Vec<bool>,
     stack: Vec<usize>,
@@ -183,9 +188,27 @@ impl FastExtractor {
             for y in 0..out_height {
                 let cy = (y as f32 / block_size as f32) - 0.5;
                 let gy0 = cy.floor().clamp(0.0, grid_h.saturating_sub(1) as f32) as usize;
-                bg_gy0[y] = gy0;
-                bg_gy1[y] = (gy0 + 1).min(grid_h.saturating_sub(1));
+                // Pre-multiply by stride to eliminate per-row multiplications in the hot loop
+                bg_gy0[y] = gy0 * grid_w;
+                bg_gy1[y] = (gy0 + 1).min(grid_h.saturating_sub(1)) * grid_w;
                 bg_ty[y] = cy - cy.floor();
+            }
+        }
+
+        // Pre-calculate weights for Centroid Window calculation
+        let mut cw_wx = Vec::new();
+        let mut cw_wy = Vec::new();
+        let mut cw_strides = Vec::new();
+
+        if let Some(mut window) = options.centroid_window {
+            window = window.min(height).min(width);
+            cw_wx.reserve(window);
+            cw_wy.reserve(window);
+            cw_strides.reserve(window);
+            for w in 0..window {
+                cw_wx.push(w as f64 + 0.5);
+                cw_wy.push(w as f64 + 0.5);
+                cw_strides.push(w * width);
             }
         }
 
@@ -211,6 +234,9 @@ impl FastExtractor {
             bg_gy0,
             bg_gy1,
             bg_ty,
+            cw_wx,
+            cw_wy,
+            cw_strides,
             mask: vec![false; out_pixels],
             stack: Vec::with_capacity(1024),
         }
@@ -347,7 +373,11 @@ impl FastExtractor {
                                 for y in start_y..end_y {
                                     let row_start = y * self.out_width;
                                     for x in start_x..end_x {
-                                        block_pixels.push(self.downsampled_u32[row_start + x]);
+                                        unsafe {
+                                            block_pixels.push(
+                                                *self.downsampled_u32.get_unchecked(row_start + x),
+                                            );
+                                        }
                                     }
                                 }
                                 let mid = block_pixels.len() / 2;
@@ -356,7 +386,7 @@ impl FastExtractor {
                             },
                         );
 
-                        // Isolate LUTs to satisfy borrow checker in par_iter closure
+                        // Isolate LUTs to satisfy borrow checker
                         let bg_grid = &self.bg_grid;
                         let bg_gx0 = &self.bg_gx0;
                         let bg_gx1 = &self.bg_gx1;
@@ -372,32 +402,33 @@ impl FastExtractor {
                             .enumerate()
                             .map(|(y, (out_row, src_row))| {
                                 let mut row_sq_sum = 0.0;
-                                let gy0 = bg_gy0[y];
-                                let gy1 = bg_gy1[y];
+                                let row0_start = bg_gy0[y];
+                                let row1_start = bg_gy1[y];
                                 let ty = bg_ty[y];
 
-                                let row0_start = gy0 * grid_w;
-                                let row1_start = gy1 * grid_w;
                                 let row_v0 = &bg_grid[row0_start..row0_start + grid_w];
                                 let row_v1 = &bg_grid[row1_start..row1_start + grid_w];
 
                                 for x in 0..self.out_width {
-                                    let gx0 = bg_gx0[x];
-                                    let gx1 = bg_gx1[x];
-                                    let tx = bg_tx[x];
+                                    unsafe {
+                                        let gx0 = *bg_gx0.get_unchecked(x);
+                                        let gx1 = *bg_gx1.get_unchecked(x);
+                                        let tx = *bg_tx.get_unchecked(x);
 
-                                    let v00 = row_v0[gx0];
-                                    let v10 = row_v0[gx1];
-                                    let v01 = row_v1[gx0];
-                                    let v11 = row_v1[gx1];
+                                        let v00 = *row_v0.get_unchecked(gx0);
+                                        let v10 = *row_v0.get_unchecked(gx1);
+                                        let v01 = *row_v1.get_unchecked(gx0);
+                                        let v11 = *row_v1.get_unchecked(gx1);
 
-                                    let interp_top = v00 + tx * (v10 - v00);
-                                    let interp_bot = v01 + tx * (v11 - v01);
-                                    let bg_val = interp_top + ty * (interp_bot - interp_top);
+                                        let interp_top = v00 + tx * (v10 - v00);
+                                        let interp_bot = v01 + tx * (v11 - v01);
+                                        let bg_val = interp_top + ty * (interp_bot - interp_top);
 
-                                    let val_f32 = (src_row[x] as f32) - bg_val;
-                                    out_row[x] = (val_f32 * 128.0).round() as i32;
-                                    row_sq_sum += (val_f32 as f64) * (val_f32 as f64);
+                                        let val_f32 = (*src_row.get_unchecked(x) as f32) - bg_val;
+                                        *out_row.get_unchecked_mut(x) =
+                                            (val_f32 * 128.0).round() as i32;
+                                        row_sq_sum += (val_f32 as f64) * (val_f32 as f64);
+                                    }
                                 }
                                 row_sq_sum
                             })
@@ -429,7 +460,6 @@ impl FastExtractor {
                         .extend(self.image_i32.iter().map(|&v| v.abs()));
                     let mid = self.median_scratch_i32.len() / 2;
                     let (_, &mut median, _) = self.median_scratch_i32.select_nth_unstable(mid);
-                    // Divide by 128.0 to return from scaled integer back to original float scale
                     (median as f32 / 128.0) * 1.48 * self.options.sigma
                 }
             };
@@ -446,6 +476,9 @@ impl FastExtractor {
                 &self.options,
                 &mut self.mask,
                 &mut self.stack,
+                &self.cw_wx,
+                &self.cw_wy,
+                &self.cw_strides,
             )
         } else {
             // =====================================================================================
@@ -503,7 +536,10 @@ impl FastExtractor {
                                 for y in start_y..end_y {
                                     let row_start = y * self.width;
                                     for x in start_x..end_x {
-                                        block_pixels.push(src_slice[row_start + x]);
+                                        unsafe {
+                                            block_pixels
+                                                .push(*src_slice.get_unchecked(row_start + x));
+                                        }
                                     }
                                 }
                                 let mid = block_pixels.len() / 2;
@@ -527,32 +563,33 @@ impl FastExtractor {
                             .enumerate()
                             .map(|(y, (out_row, src_row))| {
                                 let mut row_sq_sum = 0.0;
-                                let gy0 = bg_gy0[y];
-                                let gy1 = bg_gy1[y];
+                                let row0_start = bg_gy0[y];
+                                let row1_start = bg_gy1[y];
                                 let ty = bg_ty[y];
 
-                                let row0_start = gy0 * grid_w;
-                                let row1_start = gy1 * grid_w;
                                 let row_v0 = &bg_grid[row0_start..row0_start + grid_w];
                                 let row_v1 = &bg_grid[row1_start..row1_start + grid_w];
 
                                 for x in 0..self.width {
-                                    let gx0 = bg_gx0[x];
-                                    let gx1 = bg_gx1[x];
-                                    let tx = bg_tx[x];
+                                    unsafe {
+                                        let gx0 = *bg_gx0.get_unchecked(x);
+                                        let gx1 = *bg_gx1.get_unchecked(x);
+                                        let tx = *bg_tx.get_unchecked(x);
 
-                                    let v00 = row_v0[gx0];
-                                    let v10 = row_v0[gx1];
-                                    let v01 = row_v1[gx0];
-                                    let v11 = row_v1[gx1];
+                                        let v00 = *row_v0.get_unchecked(gx0);
+                                        let v10 = *row_v0.get_unchecked(gx1);
+                                        let v01 = *row_v1.get_unchecked(gx0);
+                                        let v11 = *row_v1.get_unchecked(gx1);
 
-                                    let interp_top = v00 + tx * (v10 - v00);
-                                    let interp_bot = v01 + tx * (v11 - v01);
-                                    let bg_val = interp_top + ty * (interp_bot - interp_top);
+                                        let interp_top = v00 + tx * (v10 - v00);
+                                        let interp_bot = v01 + tx * (v11 - v01);
+                                        let bg_val = interp_top + ty * (interp_bot - interp_top);
 
-                                    let val_f32 = (src_row[x] as f32) - bg_val;
-                                    out_row[x] = (val_f32 * 128.0).round() as i16;
-                                    row_sq_sum += (val_f32 as f64) * (val_f32 as f64);
+                                        let val_f32 = (*src_row.get_unchecked(x) as f32) - bg_val;
+                                        *out_row.get_unchecked_mut(x) =
+                                            (val_f32 * 128.0).round() as i16;
+                                        row_sq_sum += (val_f32 as f64) * (val_f32 as f64);
+                                    }
                                 }
                                 row_sq_sum
                             })
@@ -599,6 +636,9 @@ impl FastExtractor {
                 &self.options,
                 &mut self.mask,
                 &mut self.stack,
+                &self.cw_wx,
+                &self.cw_wy,
+                &self.cw_strides,
             )
         }
     }
@@ -614,6 +654,9 @@ impl FastExtractor {
         options: &FastExtractOptions,
         mask: &mut [bool],
         stack: &mut Vec<usize>,
+        cw_wx: &[f64],
+        cw_wy: &[f64],
+        cw_strides: &[usize],
     ) -> Vec<FastCentroidResult>
     where
         T: Copy + PartialOrd + Send + Sync + Into<f64>,
@@ -703,7 +746,15 @@ impl FastExtractor {
             }
         }
 
-        let mut extracted = Vec::new();
+        // Optimization: Pre-allocate capacity
+        let mut extracted = Vec::with_capacity(256);
+
+        // Pre-unwrap configuration parameters
+        let min_a = options.min_area.unwrap_or(0);
+        let max_a = options.max_area.unwrap_or(usize::MAX);
+        let min_s = options.min_sum.unwrap_or(0.0);
+        let max_s = options.max_sum.unwrap_or(f64::MAX);
+        let max_ar = options.max_axis_ratio.unwrap_or(f64::MAX);
 
         // 3. Flood Fill & Extract
         // Use an internal stack to trace 4-connected components, evaluating moments
@@ -764,28 +815,8 @@ impl FastExtractor {
                 }
             }
 
-            // Filtering rules
-            if let Some(min_a) = options.min_area {
-                if area < min_a {
-                    continue;
-                }
-            }
-            if let Some(max_a) = options.max_area {
-                if area > max_a {
-                    continue;
-                }
-            }
-            if let Some(min_s) = options.min_sum {
-                if sum < min_s {
-                    continue;
-                }
-            }
-            if let Some(max_s) = options.max_sum {
-                if sum > max_s {
-                    continue;
-                }
-            }
-            if sum == 0.0 {
+            // Filtering rules evaluated entirely against un-wrapped variables
+            if area < min_a || area > max_a || sum < min_s || sum > max_s || sum == 0.0 {
                 continue;
             }
 
@@ -804,10 +835,8 @@ impl FastExtractor {
             let minor = (2.0 * 0f64.max(m2_xx + m2_yy - root)).sqrt();
             let axis_ratio = major / minor.max(1e-9);
 
-            if let Some(max_ar) = options.max_axis_ratio {
-                if axis_ratio > max_ar || minor <= 0.0 {
-                    continue;
-                }
+            if axis_ratio > max_ar || minor <= 0.0 {
+                continue;
             }
 
             extracted.push(FastCentroidResult {
@@ -839,15 +868,18 @@ impl FastExtractor {
                 let mut sum_yc = 0.0;
 
                 for wy in 0..window {
-                    let row_start = (o_y + wy) * width + o_x;
-                    let row_slice = &img[row_start..row_start + window];
-                    let wy_f = wy as f64 + 0.5;
+                    unsafe {
+                        // Optimization: Fetch elided row bounds and precalculated floating weights directly
+                        let row_start = o_y * width + *cw_strides.get_unchecked(wy) + o_x;
+                        let row_slice = img.get_unchecked(row_start..row_start + window);
+                        let wy_f = *cw_wy.get_unchecked(wy);
 
-                    for (wx, &v) in row_slice.iter().enumerate() {
-                        let val = v.into() * (1.0 / 128.0);
-                        img_sum += val;
-                        sum_xc += val * (wx as f64 + 0.5);
-                        sum_yc += val * wy_f;
+                        for (wx, &v) in row_slice.iter().enumerate() {
+                            let val = v.into() * (1.0 / 128.0);
+                            img_sum += val;
+                            sum_xc += val * *cw_wx.get_unchecked(wx);
+                            sum_yc += val * wy_f;
+                        }
                     }
                 }
 
