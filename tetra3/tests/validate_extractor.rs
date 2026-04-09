@@ -16,6 +16,7 @@ use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
+use tetra3::fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor};
 use tetra3::{ExtractOptions, Extractor, SolveOptions, SolveStatus, Solver};
 
 // Use Rust 1.77+ c"..." literals for PyO3 0.21+ CStr requirements
@@ -1172,6 +1173,7 @@ fn test_performance_vs_cedar() {
         let cedar_ds = ds_opt.unwrap_or(1) as u32;
 
         let mut tetra_extractor = Extractor::new();
+
         let options = ExtractOptions {
             downsample: ds_opt,
             return_images: false,
@@ -1199,7 +1201,20 @@ fn test_performance_vs_cedar() {
                     cedar_img.put_pixel(x, y, image::Luma([p_val]));
                 }
             }
-            preloaded_images.push((rust_input_img, rust_input_img_u8, cedar_img));
+
+            let fast_ds = match ds_opt {
+                None | Some(1) => FastDownsample::None,
+                Some(2) => FastDownsample::X2,
+                Some(4) => FastDownsample::X4,
+                _ => panic!("Unsupported downsample factor"),
+            };
+            let fast_options = FastExtractOptions {
+                downsample: fast_ds,
+                ..Default::default()
+            };
+            let fast_extractor = FastExtractor::new(new_w as usize, new_h as usize, fast_options);
+
+            preloaded_images.push((rust_input_img, rust_input_img_u8, cedar_img, fast_extractor));
         }
 
         println!(
@@ -1208,7 +1223,9 @@ fn test_performance_vs_cedar() {
         );
 
         for _ in 0..iterations {
-            for (rust_input_img, rust_input_img_u8, cedar_img) in &preloaded_images {
+            for (rust_input_img, rust_input_img_u8, cedar_img, fast_extractor) in
+                &mut preloaded_images
+            {
                 // Run Rust Algorithm (Tetra3 Port f32)
                 let start_rust = Instant::now();
                 let _rust_result = tetra_extractor.extract(rust_input_img, options.clone());
@@ -1220,13 +1237,10 @@ fn test_performance_vs_cedar() {
                     tetra_extractor.extract_u8(rust_input_img_u8, options.clone());
                 total_rust_u8_time += start_rust_u8.elapsed();
 
-                // Run Rust Algorithm for 1x Only (Tetra3 Port Fast u8)
-                if ds_opt == None {
-                    let start_rust_fast_u8 = Instant::now();
-                    let _rust_result_fast_u8 =
-                        tetra_extractor.extract_u8_fast(rust_input_img_u8, options.clone());
-                    total_rust_fast_u8_time += start_rust_fast_u8.elapsed();
-                }
+                // Run Rust Algorithm for Fast u8
+                let start_rust_fast_u8 = Instant::now();
+                let _rust_result_fast_u8 = fast_extractor.extract(rust_input_img_u8);
+                total_rust_fast_u8_time += start_rust_fast_u8.elapsed();
 
                 // Run Cedar Detect Algorithm
                 let start_cedar = Instant::now();
@@ -1273,19 +1287,19 @@ fn test_performance_vs_cedar() {
                 total_rust_u8_time / image_count as u32
             );
         }
-        if ds_opt == None {
-            println!("----------------------------------------------");
+
+        println!("----------------------------------------------");
+        println!(
+            "Rust (Fast Extractor) Total Time  : {:.2?}",
+            total_rust_fast_u8_time
+        );
+        if image_count > 0 {
             println!(
-                "Rust (Fast u8) Total Time  : {:.2?}",
-                total_rust_fast_u8_time
+                "Rust (Fast Extractor) Avg/Image   : {:.2?}",
+                total_rust_fast_u8_time / image_count as u32
             );
-            if image_count > 0 {
-                println!(
-                    "Rust (Fast u8) Avg/Image   : {:.2?}",
-                    total_rust_fast_u8_time / image_count as u32
-                );
-            }
         }
+
         println!("----------------------------------------------");
         println!("Rust (CedarDetect) Total   : {:.2?}", total_cedar_time);
         if image_count > 0 {
@@ -1328,6 +1342,7 @@ fn test_grayscale_vs_cedar() {
 
     let image_paths = get_test_images();
     let mut tetra_extractor = Extractor::new();
+
     let options = ExtractOptions {
         downsample: None,
         return_images: false,
@@ -1413,9 +1428,14 @@ fn test_grayscale_vs_cedar() {
         let port_u8_result = tetra_extractor.extract_u8(&rust_input_img_u8, options.clone());
         let port_u8_count = port_u8_result.centroids.len();
 
-        // Run Fast u8
-        let fast_u8_result = tetra_extractor.extract_u8_fast(&rust_input_img_u8, options.clone());
-        let fast_u8_count = fast_u8_result.centroids.len();
+        // Run Fast Extractor
+        let fe_options = FastExtractOptions {
+            downsample: FastDownsample::None,
+            ..Default::default()
+        };
+        let mut fast_extractor = FastExtractor::new(w as usize, h as usize, fe_options);
+        let fast_u8_result = fast_extractor.extract(&rust_input_img_u8);
+        let fast_u8_count = fast_u8_result.len();
 
         // Run Port f32 (Original f32)
         let port_f32_result = tetra_extractor.extract(&rust_input_img_f32, options.clone());
@@ -1441,7 +1461,7 @@ fn test_grayscale_vs_cedar() {
         let u8_solve_str = format_solve!(u8_solve_res);
 
         // Solve Fast u8
-        let fast_u8_cents_arr = to_array!(&fast_u8_result.centroids, y, x);
+        let fast_u8_cents_arr = to_array!(&fast_u8_result, y, x);
         let fast_u8_solve_res = solver.solve(
             &fast_u8_cents_arr,
             (h as f64, w as f64),
@@ -1469,7 +1489,7 @@ fn test_grayscale_vs_cedar() {
 
         // Calculate top 4 Matches against Cedar
         let match_str_u8 = compare_top4!(&port_u8_result.centroids, &cedar_result.0);
-        let match_str_fast_u8 = compare_top4!(&fast_u8_result.centroids, &cedar_result.0);
+        let match_str_fast_u8 = compare_top4!(&fast_u8_result, &cedar_result.0);
 
         table_rows.push(TableRow {
             img_name,
@@ -1491,10 +1511,10 @@ fn test_grayscale_vs_cedar() {
         "Image",
         "Port f32",
         "Port u8",
-        "Fast u8",
+        "Fast Ext",
         "Cedar",
         "Top 4 Match (u8)",
-        "Top 4 Match (Fast u8)"
+        "Top 4 Match (Fast)"
     );
     println!("{}", "-".repeat(140));
 
@@ -1513,7 +1533,7 @@ fn test_grayscale_vs_cedar() {
 
     println!(
         "\n\n{:<40} | {:<25} | {:<25} | {:<25} | {:<25}",
-        "Image", "Color f32 Solved", "Port u8 Solved", "Fast u8 Solved", "Cedar Solved"
+        "Image", "Color f32 Solved", "Port u8 Solved", "Fast Ext Solved", "Cedar Solved"
     );
     println!("{}", "-".repeat(154));
 
@@ -1525,6 +1545,188 @@ fn test_grayscale_vs_cedar() {
             row.u8_solve_str,
             row.fast_u8_solve_str,
             row.cedar_solve_str
+        );
+    }
+    println!();
+}
+
+#[derive(Debug)]
+struct ExtractorComparisonRow {
+    img_name: String,
+    global_median_count: usize,
+    global_median_time: std::time::Duration,
+    local_median_count: usize,
+    local_median_time: std::time::Duration,
+    fast_extractor_count: usize,
+    fast_extractor_time: std::time::Duration,
+    global_solve_str: String,
+    local_solve_str: String,
+    fast_solve_str: String,
+}
+
+#[test]
+fn test_fast_extractor_vs_others() {
+    let db_path = std::path::Path::new("tests/fixtures/default_database.npz");
+    if !db_path.exists() {
+        eprintln!("Skipping test: default_database.npz not found.");
+        return;
+    }
+    let mut solver =
+        tetra3::solver::Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+
+    let image_paths = get_test_images();
+    let mut tetra_extractor = tetra3::extractor::Extractor::new();
+
+    let mut table_rows = Vec::new();
+
+    macro_rules! format_solve {
+        ($res:expr) => {
+            if $res.status == tetra3::solver::SolveStatus::MatchFound {
+                format!(
+                    "{:.3}, {:.3}, {:.3}",
+                    $res.ra.unwrap(),
+                    $res.dec.unwrap(),
+                    $res.roll.unwrap()
+                )
+            } else {
+                "None".to_string()
+            }
+        };
+    }
+
+    macro_rules! to_array {
+        ($cents:expr, $y:ident, $x:ident) => {{
+            let mut flat = Vec::with_capacity($cents.len() * 2);
+            for c in $cents {
+                flat.push(c.$y as f64);
+                flat.push(c.$x as f64);
+            }
+            ndarray::Array2::from_shape_vec(($cents.len(), 2), flat).unwrap()
+        }};
+    }
+
+    for path in &image_paths {
+        let img_name = path.file_name().unwrap().to_string_lossy().to_string();
+        let base_img = image::open(path).unwrap();
+        let luma_img = base_img.to_luma8();
+        let (w, h) = luma_img.dimensions();
+
+        let mut rust_input_img_u8 = ndarray::Array2::<u8>::zeros((h as usize, w as usize));
+        for y in 0..h {
+            for x in 0..w {
+                rust_input_img_u8[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0];
+            }
+        }
+
+        // Global Median (Original Extractor)
+        let opt_global = tetra3::extractor::ExtractOptions {
+            downsample: None,
+            return_images: false,
+            bg_sub_mode: Some(tetra3::extractor::BgSubMode::GlobalMedian),
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let res_global = tetra_extractor.extract_u8(&rust_input_img_u8, opt_global);
+        let global_median_time = t0.elapsed();
+        let global_median_count = res_global.centroids.len();
+
+        // Local Median (Original Extractor)
+        let opt_local = tetra3::extractor::ExtractOptions {
+            downsample: None,
+            return_images: false,
+            bg_sub_mode: Some(tetra3::extractor::BgSubMode::LocalMedian),
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let res_local = tetra_extractor.extract_u8(&rust_input_img_u8, opt_local);
+        let local_median_time = t0.elapsed();
+        let local_median_count = res_local.centroids.len();
+
+        // Fast Extractor
+        let opt_fast = FastExtractOptions {
+            downsample: FastDownsample::None,
+            bg_sub_mode: Some(FastBgSubMode::GlobalMedian),
+            ..Default::default()
+        };
+        let mut fast_extractor = FastExtractor::new(w as usize, h as usize, opt_fast);
+        let t0 = std::time::Instant::now();
+        let res_fast = fast_extractor.extract(&rust_input_img_u8);
+        let fast_extractor_time = t0.elapsed();
+        let fast_extractor_count = res_fast.len();
+
+        let global_cents_arr = to_array!(&res_global.centroids, y, x);
+        let global_solve_res = solver.solve(
+            &global_cents_arr,
+            (h as f64, w as f64),
+            tetra3::solver::SolveOptions::default(),
+        );
+        let global_solve_str = format_solve!(global_solve_res);
+
+        let local_cents_arr = to_array!(&res_local.centroids, y, x);
+        let local_solve_res = solver.solve(
+            &local_cents_arr,
+            (h as f64, w as f64),
+            tetra3::solver::SolveOptions::default(),
+        );
+        let local_solve_str = format_solve!(local_solve_res);
+
+        let fast_cents_arr = to_array!(&res_fast, y, x);
+        let fast_solve_res = solver.solve(
+            &fast_cents_arr,
+            (h as f64, w as f64),
+            tetra3::solver::SolveOptions::default(),
+        );
+        let fast_solve_str = format_solve!(fast_solve_res);
+
+        table_rows.push(ExtractorComparisonRow {
+            img_name,
+            global_median_count,
+            global_median_time,
+            local_median_count,
+            local_median_time,
+            fast_extractor_count,
+            fast_extractor_time,
+            global_solve_str,
+            local_solve_str,
+            fast_solve_str,
+        });
+    }
+
+    println!(
+        "\n{:<40} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15} | {:<15}",
+        "Image",
+        "Global Count",
+        "Global Time",
+        "Local Count",
+        "Local Time",
+        "Fast Count",
+        "Fast Time"
+    );
+    println!("{}", "-".repeat(145));
+
+    for row in &table_rows {
+        println!(
+            "{:<40} | {:<15} | {:<15?} | {:<15} | {:<15?} | {:<15} | {:<15?}",
+            row.img_name,
+            row.global_median_count,
+            row.global_median_time,
+            row.local_median_count,
+            row.local_median_time,
+            row.fast_extractor_count,
+            row.fast_extractor_time
+        );
+    }
+
+    println!(
+        "\n{:<40} | {:<30} | {:<30} | {:<30}",
+        "Image", "Global Solved", "Local Solved", "Fast Solved"
+    );
+    println!("{}", "-".repeat(140));
+
+    for row in &table_rows {
+        println!(
+            "{:<40} | {:<30} | {:<30} | {:<30}",
+            row.img_name, row.global_solve_str, row.local_solve_str, row.fast_solve_str
         );
     }
     println!();
