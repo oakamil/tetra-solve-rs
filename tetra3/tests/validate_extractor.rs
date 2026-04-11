@@ -10,10 +10,27 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
+
+static RAYON_INIT: Once = Once::new();
+
+fn init_rayon_thread_pool() {
+    RAYON_INIT.call_once(|| {
+        let num_threads = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4); // Default to 4 threads
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build_global()
+            .ok(); // Ignore if already initialized (though Once ensures it only runs once)
+    });
+}
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
 use tetra3::fast_extractor::{
@@ -439,6 +456,7 @@ fn run_validation_suite_from_fixtures(
 
 #[test]
 fn test_extraction_against_python_sanity() {
+    init_rayon_thread_pool();
     // Tests only the default extraction modes to ensure the base path works against fixtures.
     let bg_modes = [(Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean")];
     let sigma_modes = [(
@@ -452,6 +470,7 @@ fn test_extraction_against_python_sanity() {
 
 #[test]
 fn test_extraction_against_python_full() {
+    init_rayon_thread_pool();
     // Tests all permutations of background subtraction, sigma thresholding, and downsampling.
     let bg_modes = [
         (
@@ -812,6 +831,7 @@ fn run_validation_suite_u8(
 
 #[test]
 fn test_extraction_u8_sanity() {
+    init_rayon_thread_pool();
     let bg_modes = [(Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean")];
     let sigma_modes = [(
         tetra3::extractor::SigmaMode::GlobalRootSquare,
@@ -824,6 +844,7 @@ fn test_extraction_u8_sanity() {
 
 #[test]
 fn test_extraction_u8_full() {
+    init_rayon_thread_pool();
     let bg_modes = [
         (
             Some(tetra3::extractor::BgSubMode::LocalMedian),
@@ -870,6 +891,7 @@ fn test_extraction_u8_full() {
 // Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored --nocapture
 // This test requires the tetra3 module to be loaded in the Python environment
 fn generate_python_test_fixtures() {
+    init_rayon_thread_pool();
     let bg_modes = [
         (
             Some(tetra3::extractor::BgSubMode::LocalMedian),
@@ -1034,6 +1056,7 @@ fn generate_python_test_fixtures() {
 // Run intentionally via: cargo test test_performance_vs_python --release -- --ignored
 // This test requires the tetra3 module to be loaded in the Python environment
 fn test_performance_vs_python() {
+    init_rayon_thread_pool();
     let mut total_rust_time = Duration::ZERO;
     let mut total_rust_u8_time = Duration::ZERO;
     let mut total_py_time = Duration::ZERO;
@@ -1161,6 +1184,7 @@ fn test_performance_vs_python() {
 #[test]
 #[ignore]
 fn test_performance_vs_cedar() {
+    init_rayon_thread_pool();
     let iterations = 50;
     let image_paths = get_test_images();
     let downsamples = [None, Some(2), Some(4)];
@@ -1335,6 +1359,7 @@ struct TableRow {
 #[test]
 #[ignore]
 fn test_grayscale_vs_cedar() {
+    init_rayon_thread_pool();
     let db_path = Path::new("tests/fixtures/default_database.npz");
     if !db_path.exists() {
         eprintln!("Skipping test: default_database.npz not found.");
@@ -1571,6 +1596,7 @@ struct ExtractorComparisonRow {
 
 #[test]
 fn test_fast_extractor_vs_others() {
+    init_rayon_thread_pool();
     let db_path = std::path::Path::new("tests/fixtures/default_database.npz");
     if !db_path.exists() {
         eprintln!("Skipping test: default_database.npz not found.");
@@ -1771,6 +1797,7 @@ fn test_fast_extractor_vs_others() {
 #[test]
 #[ignore]
 fn test_benchmark_block_median() {
+    init_rayon_thread_pool();
     let iterations = 200;
     let image_paths = get_test_images();
     let downsamples = [FastDownsample::None, FastDownsample::X2, FastDownsample::X4];

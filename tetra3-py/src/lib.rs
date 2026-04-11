@@ -5,6 +5,23 @@ use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::path::PathBuf;
+use std::sync::Once;
+
+static RAYON_INIT: Once = Once::new();
+
+fn init_rayon_thread_pool() {
+    RAYON_INIT.call_once(|| {
+        let num_threads = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2); // Default to 2 threads for the Python wrapper
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build_global()
+            .ok();
+    });
+}
 
 use tetra3_core::Tetra3;
 use tetra3_core::extractor::{BgSubMode, ExtractOptions, SigmaMode};
@@ -23,6 +40,7 @@ impl PyTetra3 {
     /// the first plate solving operation is executed.
     #[new]
     fn new(database_path: String) -> Self {
+        init_rayon_thread_pool();
         Self {
             inner: Tetra3::new(PathBuf::from(database_path)),
         }
@@ -350,6 +368,7 @@ fn parse_solve_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<SolveOpti
 #[pymodule]
 #[pyo3(name = "tetra3_py")]
 fn tetra3(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    init_rayon_thread_pool();
     m.add_class::<PyTetra3>()?;
     Ok(())
 }
