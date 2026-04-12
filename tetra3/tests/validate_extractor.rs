@@ -1798,7 +1798,7 @@ fn test_fast_extractor_vs_others() {
 #[ignore]
 fn test_benchmark_bg_sub_modes() {
     init_rayon_thread_pool();
-    let iterations = 200;
+    let iterations = 1000;
     let image_paths = get_test_images();
     let downsamples = [FastDownsample::None, FastDownsample::X2, FastDownsample::X4];
 
@@ -1841,7 +1841,7 @@ fn test_benchmark_bg_sub_modes() {
                 ..Default::default()
             };
 
-            let mut extractor = FastExtractor::new(new_w as usize, new_h as usize, options);
+            let mut extractor = FastExtractor::new(new_w as usize, new_h as usize, options.clone());
 
             let mut total_time = Duration::ZERO;
             for _ in 0..iterations {
@@ -1852,6 +1852,179 @@ fn test_benchmark_bg_sub_modes() {
 
             let avg_time = total_time / iterations as u32;
             println!("{:<15} -> Average Time: {:.2?}", mode_name, avg_time);
+
+            // Also test sequential version
+            let mut extractor_seq = FastExtractor::new(new_w as usize, new_h as usize, options);
+            let mut total_time_seq = Duration::ZERO;
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let _res = extractor_seq.extract_sequential(&input_img);
+                total_time_seq += start.elapsed();
+            }
+            let avg_time_seq = total_time_seq / iterations as u32;
+            println!(
+                "{:<15} -> Average Time (Sequential): {:.2?}",
+                mode_name, avg_time_seq
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn test_fast_extractor_accuracy() {
+    init_rayon_thread_pool();
+    let image_paths = get_test_images();
+
+    // Test on 3 diverse images to keep the test fast but representative
+    let test_imgs = image_paths.into_iter().take(3).collect::<Vec<_>>();
+
+    let downsamples = [FastDownsample::None, FastDownsample::X2, FastDownsample::X4];
+    let sigma_modes = [
+        FastSigmaMode::GlobalRootSquare,
+        FastSigmaMode::GlobalMedianAbs,
+    ];
+    let bg_modes = [
+        (
+            Some(FastBgSubMode::GlobalMean),
+            Some(tetra3::extractor::BgSubMode::GlobalMean),
+        ),
+        (
+            Some(FastBgSubMode::GlobalMedian),
+            Some(tetra3::extractor::BgSubMode::GlobalMedian),
+        ),
+    ];
+
+    for path in &test_imgs {
+        let base_img = image::open(path).unwrap();
+        let luma_img = base_img.to_luma8();
+        let (w, h) = luma_img.dimensions();
+
+        let mut input_img = ndarray::Array2::<u8>::zeros((h as usize, w as usize));
+        for y in 0..h {
+            for x in 0..w {
+                input_img[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0];
+            }
+        }
+
+        for &ds in &downsamples {
+            for &sig in &sigma_modes {
+                for &(fast_bg, base_bg) in &bg_modes {
+                    let base_sig = match sig {
+                        FastSigmaMode::GlobalRootSquare => {
+                            tetra3::extractor::SigmaMode::GlobalRootSquare
+                        }
+                        FastSigmaMode::GlobalMedianAbs => {
+                            tetra3::extractor::SigmaMode::GlobalMedianAbs
+                        }
+                    };
+
+                    let base_options = tetra3::ExtractOptions {
+                        downsample: Some(ds.factor()),
+                        bg_sub_mode: base_bg,
+                        sigma_mode: base_sig,
+                        ..Default::default()
+                    };
+
+                    let fast_options = FastExtractOptions {
+                        downsample: ds,
+                        bg_sub_mode: fast_bg,
+                        sigma_mode: sig,
+                        ..Default::default()
+                    };
+
+                    let mut base_extractor = tetra3::extractor::Extractor::new();
+                    let base_res = base_extractor.extract_u8(&input_img, base_options.clone());
+
+                    let mut fast_extractor =
+                        FastExtractor::new(w as usize, h as usize, fast_options.clone());
+                    let fast_res = fast_extractor.extract(&input_img);
+
+                    let mut fast_extractor_seq =
+                        FastExtractor::new(w as usize, h as usize, fast_options.clone());
+                    let fast_res_seq = fast_extractor_seq.extract_sequential(&input_img);
+
+                    let mut b_sorted = base_res.centroids.clone();
+                    b_sorted.sort_by(|a, b| {
+                        a.y.partial_cmp(&b.y)
+                            .unwrap()
+                            .then(a.x.partial_cmp(&b.x).unwrap())
+                    });
+
+                    let mut f_sorted = fast_res.clone();
+                    f_sorted.sort_by(|a, b| {
+                        a.y.partial_cmp(&b.y)
+                            .unwrap()
+                            .then(a.x.partial_cmp(&b.x).unwrap())
+                    });
+
+                    assert_eq!(
+                        base_res.centroids.len(),
+                        fast_res.len(),
+                        "Mismatch in number of centroids extracted for {:?}",
+                        path
+                    );
+
+                    // Ensure parallel fast extraction aligns with base extractor 100%
+                    let mut matched_fast = 0;
+                    for b in &base_res.centroids {
+                        for f in &fast_res {
+                            let dist = ((b.x - f.x).powi(2) + (b.y - f.y).powi(2)).sqrt();
+                            if dist < 0.5 {
+                                // Fairly strict tolerance
+                                assert!(
+                                    (b.sum - f.sum).abs() < 1.0,
+                                    "Sum mismatch: Base {:.3} vs Fast {:.3} (img: {:?}, ds: {:?}, bg: {:?}, sig: {:?})",
+                                    b.sum,
+                                    f.sum,
+                                    path,
+                                    ds,
+                                    fast_bg,
+                                    sig
+                                );
+                                assert_eq!(
+                                    b.area, f.area,
+                                    "Area mismatch: Base {} vs Fast {} (img: {:?}, ds: {:?}, bg: {:?}, sig: {:?})",
+                                    b.area, f.area, path, ds, fast_bg, sig
+                                );
+                                matched_fast += 1;
+                                break;
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        matched_fast,
+                        base_res.centroids.len(),
+                        "Parallel FastExtractor failed to match Base Extractor exactly for {:?}",
+                        path
+                    );
+
+                    // For sequential (which uses row-skipping and is therefore an approximation),
+                    // we verify that at least 95% of the base centroids were found within 1.5 pixels.
+                    if b_sorted.len() == 0 {
+                        continue;
+                    }
+
+                    let mut matched = 0;
+                    for b in &base_res.centroids {
+                        for f_seq in &fast_res_seq {
+                            let dist = ((b.x - f_seq.x).powi(2) + (b.y - f_seq.y).powi(2)).sqrt();
+                            if dist < 1.5 {
+                                matched += 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    let match_rate = matched as f64 / b_sorted.len().max(1) as f64;
+                    assert!(
+                        match_rate >= 0.95,
+                        "Sequential approximation matched only {:.1}% of centroids (required 95%) for {:?}",
+                        match_rate * 100.0,
+                        path
+                    );
+                }
+            }
         }
     }
 }

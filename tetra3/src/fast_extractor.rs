@@ -332,6 +332,8 @@ impl FastExtractor {
                             .sum()
                     }
                     FastBgSubMode::GlobalMedian => {
+                        // OPTIMIZATION: Parallel histogram computation using large chunk sizes minimizes
+                        // thread-local allocations and avoids O(N) memory copies/sorting.
                         let hist = self
                             .downsampled_u32
                             .par_chunks(16384.max(self.out_width))
@@ -564,6 +566,8 @@ impl FastExtractor {
                             .sum()
                     }
                     FastBgSubMode::GlobalMedian => {
+                        // OPTIMIZATION: Parallel histogram computation using large chunk sizes minimizes
+                        // thread-local allocations and avoids O(N) memory copies/sorting.
                         let hist = src_slice
                             .par_chunks(16384.max(self.width))
                             .fold(
@@ -1028,3 +1032,5 @@ impl FastExtractor {
         extracted
     }
 }
+
+include!("fast_extractor_seq.rs");
