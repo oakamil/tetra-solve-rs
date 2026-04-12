@@ -127,8 +127,6 @@ pub struct FastExtractor {
     // -------------------------------------------------------------------------
     // Utility & Scratch Buffers
     // -------------------------------------------------------------------------
-    median_scratch_u8: Vec<u8>,
-    median_scratch_u32: Vec<u32>,
     median_scratch_i16: Vec<i16>,
     median_scratch_i32: Vec<i32>,
 
@@ -220,8 +218,6 @@ impl FastExtractor {
             image_i16: vec![0; total_pixels],
             image_i32: vec![0; out_pixels],
             // Pre-allocate exact capacities for median filtering
-            median_scratch_u8: Vec::with_capacity(total_pixels),
-            median_scratch_u32: Vec::with_capacity(out_pixels),
             median_scratch_i16: Vec::with_capacity(total_pixels),
             median_scratch_i32: Vec::with_capacity(out_pixels),
             bg_grid,
@@ -322,32 +318,65 @@ impl FastExtractor {
                         let sum: u64 = self.downsampled_u32.par_iter().map(|&v| v as u64).sum();
                         let mean = (sum as f64 / self.downsampled_u32.len() as f64) as f32;
                         self.image_i32
-                            .par_iter_mut()
-                            .zip(self.downsampled_u32.par_iter())
-                            .map(|(o, &i)| {
-                                let val_f32 = (i as f32) - mean;
-                                // Rounding prevents truncation bias towards zero
-                                *o = (val_f32 * 128.0).round() as i32;
-                                (val_f32 as f64) * (val_f32 as f64)
+                            .par_chunks_exact_mut(self.out_width)
+                            .zip(self.downsampled_u32.par_chunks_exact(self.out_width))
+                            .map(|(o_row, i_row)| {
+                                let mut row_sum_sq = 0.0;
+                                for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
+                                    let val_f32 = (i as f32) - mean;
+                                    *o = (val_f32 * 128.0).round() as i32;
+                                    row_sum_sq += (val_f32 * val_f32) as f64;
+                                }
+                                row_sum_sq
                             })
                             .sum()
                     }
                     FastBgSubMode::GlobalMedian => {
-                        self.median_scratch_u32.clear();
-                        self.median_scratch_u32
-                            .extend_from_slice(&self.downsampled_u32);
-                        let mid = self.median_scratch_u32.len() / 2;
-                        let (_, &mut median, _) = self
-                            .median_scratch_u32
-                            .select_nth_unstable_by(mid, |a, b| a.cmp(b));
-                        let med = median as f32;
+                        let hist = self
+                            .downsampled_u32
+                            .par_chunks(16384.max(self.out_width))
+                            .fold(
+                                || vec![0u32; 4096],
+                                |mut h, chunk| {
+                                    for &v in chunk {
+                                        unsafe {
+                                            *h.get_unchecked_mut(v as usize) += 1;
+                                        }
+                                    }
+                                    h
+                                },
+                            )
+                            .reduce(
+                                || vec![0u32; 4096],
+                                |mut h1, h2| {
+                                    for (a, b) in h1.iter_mut().zip(h2.iter()) {
+                                        *a += b;
+                                    }
+                                    h1
+                                },
+                            );
+                        let target = ((self.downsampled_u32.len() + 1) / 2) as u32;
+                        let mut accum = 0;
+                        let mut med = 0.0f32;
+                        for (val, &count) in hist.iter().enumerate() {
+                            accum += count;
+                            if accum >= target {
+                                med = val as f32;
+                                break;
+                            }
+                        }
+
                         self.image_i32
-                            .par_iter_mut()
-                            .zip(self.downsampled_u32.par_iter())
-                            .map(|(o, &i)| {
-                                let val_f32 = (i as f32) - med;
-                                *o = (val_f32 * 128.0).round() as i32;
-                                (val_f32 as f64) * (val_f32 as f64)
+                            .par_chunks_exact_mut(self.out_width)
+                            .zip(self.downsampled_u32.par_chunks_exact(self.out_width))
+                            .map(|(o_row, i_row)| {
+                                let mut row_sum_sq = 0.0;
+                                for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
+                                    let val_f32 = (i as f32) - med;
+                                    *o = (val_f32 * 128.0).round() as i32;
+                                    row_sum_sq += (val_f32 * val_f32) as f64;
+                                }
+                                row_sum_sq
                             })
                             .sum()
                     }
@@ -456,7 +485,7 @@ impl FastExtractor {
                                         let val_f32 = (*src_row.get_unchecked(x) as f32) - bg_val;
                                         *out_row.get_unchecked_mut(x) =
                                             (val_f32 * 128.0).round() as i32;
-                                        row_sq_sum += (val_f32 as f64) * (val_f32 as f64);
+                                        row_sq_sum += (val_f32 * val_f32) as f64;
                                     }
                                 }
                                 row_sq_sum
@@ -471,7 +500,7 @@ impl FastExtractor {
                     .map(|(o, &i)| {
                         let val_f32 = i as f32;
                         *o = (val_f32 * 128.0).round() as i32;
-                        (val_f32 as f64) * (val_f32 as f64)
+                        (val_f32 * val_f32) as f64
                     })
                     .sum()
             };
@@ -521,30 +550,64 @@ impl FastExtractor {
                         let sum: u64 = src_slice.par_iter().map(|&v| v as u64).sum();
                         let mean = (sum as f64 / src_slice.len() as f64) as f32;
                         self.image_i16
-                            .par_iter_mut()
-                            .zip(src_slice.par_iter())
-                            .map(|(o, &i)| {
-                                let val_f32 = (i as f32) - mean;
-                                *o = (val_f32 * 128.0).round() as i16;
-                                (val_f32 as f64) * (val_f32 as f64)
+                            .par_chunks_exact_mut(self.width)
+                            .zip(src_slice.par_chunks_exact(self.width))
+                            .map(|(o_row, i_row)| {
+                                let mut row_sum_sq = 0.0;
+                                for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
+                                    let val_f32 = (i as f32) - mean;
+                                    *o = (val_f32 * 128.0).round() as i16;
+                                    row_sum_sq += (val_f32 * val_f32) as f64;
+                                }
+                                row_sum_sq
                             })
                             .sum()
                     }
                     FastBgSubMode::GlobalMedian => {
-                        self.median_scratch_u8.clear();
-                        self.median_scratch_u8.extend_from_slice(src_slice);
-                        let mid = self.median_scratch_u8.len() / 2;
-                        let (_, &mut median, _) = self
-                            .median_scratch_u8
-                            .select_nth_unstable_by(mid, |a, b| a.cmp(b));
-                        let med = median as f32;
+                        let hist = src_slice
+                            .par_chunks(16384.max(self.width))
+                            .fold(
+                                || vec![0u32; 256],
+                                |mut h, chunk| {
+                                    for &v in chunk {
+                                        unsafe {
+                                            *h.get_unchecked_mut(v as usize) += 1;
+                                        }
+                                    }
+                                    h
+                                },
+                            )
+                            .reduce(
+                                || vec![0u32; 256],
+                                |mut h1, h2| {
+                                    for (a, b) in h1.iter_mut().zip(h2.iter()) {
+                                        *a += b;
+                                    }
+                                    h1
+                                },
+                            );
+                        let target = ((src_slice.len() + 1) / 2) as u32;
+                        let mut accum = 0;
+                        let mut med = 0.0f32;
+                        for (val, &count) in hist.iter().enumerate() {
+                            accum += count;
+                            if accum >= target {
+                                med = val as f32;
+                                break;
+                            }
+                        }
+
                         self.image_i16
-                            .par_iter_mut()
-                            .zip(src_slice.par_iter())
-                            .map(|(o, &i)| {
-                                let val_f32 = (i as f32) - med;
-                                *o = (val_f32 * 128.0).round() as i16;
-                                (val_f32 as f64) * (val_f32 as f64)
+                            .par_chunks_exact_mut(self.width)
+                            .zip(src_slice.par_chunks_exact(self.width))
+                            .map(|(o_row, i_row)| {
+                                let mut row_sum_sq = 0.0;
+                                for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
+                                    let val_f32 = (i as f32) - med;
+                                    *o = (val_f32 * 128.0).round() as i16;
+                                    row_sum_sq += (val_f32 * val_f32) as f64;
+                                }
+                                row_sum_sq
                             })
                             .sum()
                     }
@@ -651,7 +714,7 @@ impl FastExtractor {
                                         let val_f32 = (*src_row.get_unchecked(x) as f32) - bg_val;
                                         *out_row.get_unchecked_mut(x) =
                                             (val_f32 * 128.0).round() as i16;
-                                        row_sq_sum += (val_f32 as f64) * (val_f32 as f64);
+                                        row_sq_sum += (val_f32 * val_f32) as f64;
                                     }
                                 }
                                 row_sq_sum
@@ -668,7 +731,7 @@ impl FastExtractor {
                     .map(|(o, &i)| {
                         let val_f32 = i as f32;
                         *o = (val_f32 * 128.0).round() as i16;
-                        (val_f32 as f64) * (val_f32 as f64)
+                        (val_f32 * val_f32) as f64
                     })
                     .sum()
             };

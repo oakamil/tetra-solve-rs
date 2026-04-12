@@ -1796,14 +1796,25 @@ fn test_fast_extractor_vs_others() {
 
 #[test]
 #[ignore]
-fn test_benchmark_block_median() {
+fn test_benchmark_bg_sub_modes() {
     init_rayon_thread_pool();
     let iterations = 200;
     let image_paths = get_test_images();
     let downsamples = [FastDownsample::None, FastDownsample::X2, FastDownsample::X4];
 
+    let modes = [
+        (Some(FastBgSubMode::GlobalMean), "GlobalMean"),
+        (Some(FastBgSubMode::GlobalMedian), "GlobalMedian"),
+        (
+            Some(FastBgSubMode::BlockMedian { block_size: 64 }),
+            "BlockMedian(64)",
+        ),
+    ];
+
     for &ds in &downsamples {
-        let mut total_time = Duration::ZERO;
+        println!("\n==============================================");
+        println!("Benchmarking Downsample: {:?}", ds);
+        println!("==============================================");
 
         // Use the first image for benchmarking to keep it consistent
         let path = &image_paths[0];
@@ -1822,29 +1833,25 @@ fn test_benchmark_block_median() {
             }
         }
 
-        let options = FastExtractOptions {
-            downsample: ds,
-            bg_sub_mode: Some(FastBgSubMode::BlockMedian { block_size: 64 }),
-            sigma_mode: FastSigmaMode::GlobalRootSquare,
-            ..Default::default()
-        };
+        for (mode, mode_name) in &modes {
+            let options = FastExtractOptions {
+                downsample: ds,
+                bg_sub_mode: *mode,
+                sigma_mode: FastSigmaMode::GlobalRootSquare,
+                ..Default::default()
+            };
 
-        let mut extractor = FastExtractor::new(new_w as usize, new_h as usize, options);
+            let mut extractor = FastExtractor::new(new_w as usize, new_h as usize, options);
 
-        println!(
-            "Benchmarking BlockMedian + GlobalRootSquare (Downsample: {:?}, Iterations: {})...",
-            ds, iterations
-        );
+            let mut total_time = Duration::ZERO;
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let _res = extractor.extract(&input_img);
+                total_time += start.elapsed();
+            }
 
-        for _ in 0..iterations {
-            let start = Instant::now();
-            let _res = extractor.extract(&input_img);
-            total_time += start.elapsed();
+            let avg_time = total_time / iterations as u32;
+            println!("{:<15} -> Average Time: {:.2?}", mode_name, avg_time);
         }
-
-        let avg_time = total_time / iterations as u32;
-        println!("  -> Average Time: {:.2?}", avg_time);
-        println!("  -> Total Time:   {:.2?}", total_time);
-        println!("----------------------------------------------");
     }
 }
