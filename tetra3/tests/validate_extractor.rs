@@ -1871,7 +1871,6 @@ fn test_benchmark_bg_sub_modes() {
 }
 
 #[test]
-#[ignore]
 fn test_fast_extractor_accuracy() {
     init_rayon_thread_pool();
     let image_paths = get_test_images();
