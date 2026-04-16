@@ -1526,30 +1526,30 @@ impl Solver {
         // -------------------------------------------------------------
         if p_size == 4 {
             for l in 3..n_inds {
-                // OPTIMIZATION: Moving timeout and cancellation checks here.
-                // This entire path is extremely fast on current hardware,
-                // completing in well under 1ms. Timeout and cancellation aren't
-                // real possibilities but they're kept here for completeness.
-                if let Some(timeout) = options.solve_timeout_ms
-                    && t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout
-                {
-                    return Solution {
-                        status: SolveStatus::Timeout,
-                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                        ..Default::default()
-                    };
-                }
-                if self.cancelled.load(Ordering::Relaxed) {
-                    return Solution {
-                        status: SolveStatus::Cancelled,
-                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                        ..Default::default()
-                    };
-                }
-
                 for k in 2..l {
                     for j in 1..k {
                         for i in 0..j {
+                            // OPTIMIZATION: Moving timeout and cancellation checks here.
+                            // This entire path is extremely fast on current hardware,
+                            // typically completing in well under 1ms. Obstructions that
+                            // trigger many false centroids can still trigger long solves.
+                            if let Some(timeout) = options.solve_timeout_ms
+                                && t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout
+                            {
+                                return Solution {
+                                    status: SolveStatus::Timeout,
+                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                                    ..Default::default()
+                                };
+                            }
+                            if self.cancelled.load(Ordering::Relaxed) {
+                                return Solution {
+                                    status: SolveStatus::Cancelled,
+                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                                    ..Default::default()
+                                };
+                            }
+
                             let p_i = pattern_centroids_inds[i];
                             let p_j = pattern_centroids_inds[j];
                             let p_k = pattern_centroids_inds[k];
