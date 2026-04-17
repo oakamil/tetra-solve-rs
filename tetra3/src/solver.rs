@@ -76,7 +76,9 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use zip::ZipArchive;
 
 const MAGIC_RAND: u64 = 2654435761;
@@ -161,6 +163,29 @@ pub struct CatalogStar {
     pub dec: f64,
     pub vec: [f64; 3],
     pub mag: f64,
+}
+
+// --- Watchdog Types ---
+
+struct WatchdogState {
+    armed: bool,
+    shutdown: bool,
+    timeout: Duration,
+}
+
+struct WatchdogGuard<'a> {
+    sync: &'a (Mutex<WatchdogState>, Condvar),
+}
+
+impl<'a> Drop for WatchdogGuard<'a> {
+    fn drop(&mut self) {
+        let (lock, cvar) = self.sync;
+        // The instant the solver finishes or panics, we disarm the watchdog.
+        if let Ok(mut state) = lock.lock() {
+            state.armed = false;
+            cvar.notify_all();
+        }
+    }
 }
 
 // --- High-Performance Native Math Helpers ---
@@ -935,7 +960,12 @@ pub struct Solver {
     pub num_patterns: usize,
     pub linear_probe: bool,
     pub scratch: Scratchpads, // OPTIMIZATION: Instance-level persistent memory context
-    cancelled: AtomicBool,
+
+    // Watchdog context
+    abort: Arc<AtomicBool>,
+    is_cancelled: Arc<AtomicBool>,
+    watchdog_sync: Arc<(Mutex<WatchdogState>, Condvar)>,
+    watchdog_handle: Option<JoinHandle<()>>,
 }
 
 impl Solver {
@@ -1231,6 +1261,45 @@ impl Solver {
 
         let p_size = *db_props.get("pattern_size").unwrap_or(&4.0) as usize;
 
+        let abort = Arc::new(AtomicBool::new(false));
+        let is_cancelled = Arc::new(AtomicBool::new(false));
+        let watchdog_sync = Arc::new((
+            Mutex::new(WatchdogState {
+                armed: false,
+                shutdown: false,
+                timeout: Duration::from_millis(5000),
+            }),
+            Condvar::new(),
+        ));
+
+        let thread_abort = Arc::clone(&abort);
+        let thread_sync = Arc::clone(&watchdog_sync);
+
+        let watchdog_handle = std::thread::spawn(move || {
+            let (lock, cvar) = &*thread_sync;
+            let mut state = lock.lock().unwrap();
+
+            loop {
+                while !state.armed && !state.shutdown {
+                    state = cvar.wait(state).unwrap();
+                }
+
+                if state.shutdown {
+                    break;
+                }
+
+                let timeout_duration = state.timeout;
+                let (new_state, timeout_result) =
+                    cvar.wait_timeout(state, timeout_duration).unwrap();
+                state = new_state;
+
+                if timeout_result.timed_out() && state.armed {
+                    thread_abort.store(true, Ordering::Relaxed);
+                    state.armed = false; // Reset to prevent double-firing
+                }
+            }
+        });
+
         Ok(Solver {
             star_table_flat,
             pattern_catalog_flat,
@@ -1242,12 +1311,16 @@ impl Solver {
             num_patterns,
             linear_probe,
             scratch: Scratchpads::new(p_size),
-            cancelled: AtomicBool::new(false),
+            abort,
+            is_cancelled,
+            watchdog_sync,
+            watchdog_handle: Some(watchdog_handle),
         })
     }
 
     pub fn cancel_solve(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.is_cancelled.store(true, Ordering::Relaxed);
+        self.abort.store(true, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -1397,7 +1470,22 @@ impl Solver {
         let t0_solve = Instant::now();
         let (height, width) = size;
 
-        self.cancelled.store(false, Ordering::Relaxed);
+        self.abort.store(false, Ordering::Relaxed);
+        self.is_cancelled.store(false, Ordering::Relaxed);
+
+        if let Some(timeout_ms) = options.solve_timeout_ms {
+            let (lock, cvar) = &*self.watchdog_sync;
+            if let Ok(mut state) = lock.lock() {
+                state.armed = true;
+                state.timeout = Duration::from_secs_f64(timeout_ms / 1000.0);
+                cvar.notify_one(); // Wake the watchdog up!
+            }
+        }
+
+        // Guarantees the watchdog is disarmed upon *any* return path
+        let _watchdog_guard = WatchdogGuard {
+            sync: &self.watchdog_sync,
+        };
 
         let fov_initial = options
             .fov_estimate
@@ -1432,38 +1520,44 @@ impl Solver {
         // Thinning strategy
         let pattern_stars_separation_pixels =
             width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
-
-        // Populate our extracted stars directly
-        let mut image_centroids: Vec<[f64; 2]> = Vec::with_capacity(verification_stars);
+        let mut keep_for_patterns = vec![false; num_centroids_raw];
 
         for i in 0..num_centroids_raw {
             let mut occupied = false;
             let c_i = star_centroids.row(i);
-
-            // Only check spatial distance against the handful of stars we've already kept
-            for c_j in &image_centroids {
-                if ((c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2)).sqrt()
-                    < pattern_stars_separation_pixels
-                {
-                    occupied = true;
-                    break;
+            for j in 0..i {
+                if keep_for_patterns[j] {
+                    let c_j = star_centroids.row(j);
+                    if ((c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2)).sqrt()
+                        < pattern_stars_separation_pixels
+                    {
+                        occupied = true;
+                        break;
+                    }
                 }
             }
-
             if !occupied {
-                image_centroids.push([c_i[0], c_i[1]]);
-                // Break early once we have enough well-spaced stars
-                if image_centroids.len() == verification_stars {
-                    break;
-                }
+                keep_for_patterns[i] = true;
             }
         }
 
-        let num_extracted_stars = image_centroids.len();
+        let mut pattern_centroids_inds: Vec<usize> = keep_for_patterns
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, keep)| if keep { Some(i) } else { None })
+            .collect();
 
-        // Because image_centroids contains exactly our thinned stars, the indirection
-        // array maps cleanly 1:1, preventing array out-of-bounds in the combinatorics loop.
-        let pattern_centroids_inds: Vec<usize> = (0..num_extracted_stars).collect();
+        let mut num_extracted_stars = num_centroids_raw;
+        if num_centroids_raw > verification_stars {
+            num_extracted_stars = verification_stars;
+            pattern_centroids_inds.retain(|&i| i < num_extracted_stars);
+        }
+
+        // Maintain the original full set of image_centroids for the final matrix building
+        let mut image_centroids = Vec::with_capacity(num_extracted_stars);
+        for i in 0..num_extracted_stars {
+            image_centroids.push([star_centroids[[i, 0]], star_centroids[[i, 1]]]);
+        }
 
         let mut image_centroids_undist = if let Some(k) = options.distortion {
             undistort_centroids(&image_centroids, height, width, k)
@@ -1523,27 +1617,6 @@ impl Solver {
                 for k in 2..l {
                     for j in 1..k {
                         for i in 0..j {
-                            // OPTIMIZATION: Moving timeout and cancellation checks here.
-                            // This entire path is extremely fast on current hardware,
-                            // typically completing in well under 1ms. Obstructions that
-                            // trigger many false centroids can still trigger long solves.
-                            if let Some(timeout) = options.solve_timeout_ms
-                                && t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout
-                            {
-                                return Solution {
-                                    status: SolveStatus::Timeout,
-                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                                    ..Default::default()
-                                };
-                            }
-                            if self.cancelled.load(Ordering::Relaxed) {
-                                return Solution {
-                                    status: SolveStatus::Cancelled,
-                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                                    ..Default::default()
-                                };
-                            }
-
                             let p_i = pattern_centroids_inds[i];
                             let p_j = pattern_centroids_inds[j];
                             let p_k = pattern_centroids_inds[k];
@@ -1606,6 +1679,20 @@ impl Solver {
                             let mut image_pattern_largest_distance = None;
 
                             for key_idx in 0..scratch.sp_pattern_key_list.len() {
+                                // Check abort from watchdog thread or cancel_solve
+                                if self.abort.load(Ordering::Relaxed) {
+                                    let status = if self.is_cancelled.load(Ordering::Relaxed) {
+                                        SolveStatus::Cancelled
+                                    } else {
+                                        SolveStatus::Timeout
+                                    };
+                                    return Solution {
+                                        status,
+                                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                                        ..Default::default()
+                                    };
+                                }
+
                                 let pattern_key = scratch.sp_pattern_key_list[key_idx].1;
                                 let pattern_key_hash =
                                     Self::compute_pattern_key_hash_4(&pattern_key, p_bins);
@@ -1766,18 +1853,14 @@ impl Solver {
         else {
             for image_pattern_indices in breadth_first_combinations(&pattern_centroids_inds, p_size)
             {
-                if let Some(timeout) = options.solve_timeout_ms
-                    && t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout
-                {
-                    return Solution {
-                        status: SolveStatus::Timeout,
-                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                        ..Default::default()
+                if self.abort.load(Ordering::Relaxed) {
+                    let status = if self.is_cancelled.load(Ordering::Relaxed) {
+                        SolveStatus::Cancelled
+                    } else {
+                        SolveStatus::Timeout
                     };
-                }
-                if self.cancelled.load(Ordering::Relaxed) {
                     return Solution {
-                        status: SolveStatus::Cancelled,
+                        status,
                         t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
                         ..Default::default()
                     };
@@ -1992,6 +2075,24 @@ impl Solver {
             status: SolveStatus::NoMatch,
             t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
             ..Default::default()
+        }
+    }
+}
+
+impl Drop for Solver {
+    fn drop(&mut self) {
+        // Tell the watchdog to shut down
+        {
+            let (lock, cvar) = &*self.watchdog_sync;
+            if let Ok(mut state) = lock.lock() {
+                state.shutdown = true;
+                cvar.notify_one();
+            }
+        }
+
+        // Wait for the thread to exit cleanly
+        if let Some(handle) = self.watchdog_handle.take() {
+            let _ = handle.join();
         }
     }
 }
