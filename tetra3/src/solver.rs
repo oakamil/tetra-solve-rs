@@ -1617,6 +1617,20 @@ impl Solver {
                 for k in 2..l {
                     for j in 1..k {
                         for i in 0..j {
+                            // Check abort from watchdog thread or cancel_solve
+                            if self.abort.load(Ordering::Relaxed) {
+                                let status = if self.is_cancelled.load(Ordering::Relaxed) {
+                                    SolveStatus::Cancelled
+                                } else {
+                                    SolveStatus::Timeout
+                                };
+                                return Solution {
+                                    status,
+                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                                    ..Default::default()
+                                };
+                            }
+
                             let p_i = pattern_centroids_inds[i];
                             let p_j = pattern_centroids_inds[j];
                             let p_k = pattern_centroids_inds[k];
@@ -1679,20 +1693,6 @@ impl Solver {
                             let mut image_pattern_largest_distance = None;
 
                             for key_idx in 0..scratch.sp_pattern_key_list.len() {
-                                // Check abort from watchdog thread or cancel_solve
-                                if self.abort.load(Ordering::Relaxed) {
-                                    let status = if self.is_cancelled.load(Ordering::Relaxed) {
-                                        SolveStatus::Cancelled
-                                    } else {
-                                        SolveStatus::Timeout
-                                    };
-                                    return Solution {
-                                        status,
-                                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                                        ..Default::default()
-                                    };
-                                }
-
                                 let pattern_key = scratch.sp_pattern_key_list[key_idx].1;
                                 let pattern_key_hash =
                                     Self::compute_pattern_key_hash_4(&pattern_key, p_bins);
