@@ -279,7 +279,7 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
     // Vertical pass
     // Parallel over column strips for cache locality
     let strip_width = 128;
-    let num_strips = (w + strip_width - 1) / strip_width;
+    let num_strips = w.div_ceil(strip_width);
     let out_ptr = out.as_mut_ptr() as usize;
 
     (0..num_strips).into_par_iter().for_each(|strip_idx| {
@@ -432,7 +432,7 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
     // out_buffer.
     // Parallel over column strips for cache locality
     let strip_width = 128;
-    let num_strips = (w + strip_width - 1) / strip_width;
+    let num_strips = w.div_ceil(strip_width);
     let out_ptr = out.as_mut_ptr() as usize;
 
     (0..num_strips)
@@ -1035,14 +1035,13 @@ impl Extractor {
 
                             for x in 1..width - 1 {
                                 unsafe {
-                                    if *p_curr.add(x) > threshold {
-                                        if *p_curr.add(x - 1) > threshold
-                                            && *p_curr.add(x + 1) > threshold
-                                            && *p_prev.add(x) > threshold
-                                            && *p_next.add(x) > threshold
-                                        {
-                                            acc.push(row_offset + x);
-                                        }
+                                    if *p_curr.add(x) > threshold
+                                        && *p_curr.add(x - 1) > threshold
+                                        && *p_curr.add(x + 1) > threshold
+                                        && *p_prev.add(x) > threshold
+                                        && *p_next.add(x) > threshold
+                                    {
+                                        acc.push(row_offset + x);
                                     }
                                 }
                             }
@@ -1170,25 +1169,25 @@ impl Extractor {
                 }
             }
 
-            if let Some(min_a) = options.min_area {
-                if area < min_a {
-                    continue;
-                }
+            if let Some(min_a) = options.min_area
+                && area < min_a
+            {
+                continue;
             }
-            if let Some(max_a) = options.max_area {
-                if area > max_a {
-                    continue;
-                }
+            if let Some(max_a) = options.max_area
+                && area > max_a
+            {
+                continue;
             }
-            if let Some(min_s) = options.min_sum {
-                if sum < min_s {
-                    continue;
-                }
+            if let Some(min_s) = options.min_sum
+                && sum < min_s
+            {
+                continue;
             }
-            if let Some(max_s) = options.max_sum {
-                if sum > max_s {
-                    continue;
-                }
+            if let Some(max_s) = options.max_sum
+                && sum > max_s
+            {
+                continue;
             }
             if sum == 0.0 {
                 continue;
@@ -1208,10 +1207,10 @@ impl Extractor {
             let minor = (2.0 * 0f64.max(m2_xx + m2_yy - root)).sqrt();
             let axis_ratio = major / minor.max(1e-9);
 
-            if let Some(max_ar) = options.max_axis_ratio {
-                if axis_ratio > max_ar || minor <= 0.0 {
-                    continue;
-                }
+            if let Some(max_ar) = options.max_axis_ratio
+                && (axis_ratio > max_ar || minor <= 0.0)
+            {
+                continue;
             }
 
             extracted.push(CentroidResult {
@@ -1625,14 +1624,13 @@ impl Extractor {
 
                                     for x in 1..width - 1 {
                                         unsafe {
-                                            if *p_curr.add(x) > th {
-                                                if *p_curr.add(x - 1) > th
-                                                    && *p_curr.add(x + 1) > th
-                                                    && *p_prev.add(x) > th
-                                                    && *p_next.add(x) > th
-                                                {
-                                                    acc.push(row_offset + x);
-                                                }
+                                            if *p_curr.add(x) > th
+                                                && *p_curr.add(x - 1) > th
+                                                && *p_curr.add(x + 1) > th
+                                                && *p_prev.add(x) > th
+                                                && *p_next.add(x) > th
+                                            {
+                                                acc.push(row_offset + x);
                                             }
                                         }
                                     }
@@ -1701,14 +1699,13 @@ impl Extractor {
 
                                     for x in 1..width - 1 {
                                         unsafe {
-                                            if *p_curr.add(x) > *t_curr.add(x) {
-                                                if *p_curr.add(x - 1) > *t_curr.add(x - 1)
-                                                    && *p_curr.add(x + 1) > *t_curr.add(x + 1)
-                                                    && *p_prev.add(x) > *t_prev.add(x)
-                                                    && *p_next.add(x) > *t_next.add(x)
-                                                {
-                                                    acc.push(row_offset + x);
-                                                }
+                                            if *p_curr.add(x) > *t_curr.add(x)
+                                                && *p_curr.add(x - 1) > *t_curr.add(x - 1)
+                                                && *p_curr.add(x + 1) > *t_curr.add(x + 1)
+                                                && *p_prev.add(x) > *t_prev.add(x)
+                                                && *p_next.add(x) > *t_next.add(x)
+                                            {
+                                                acc.push(row_offset + x);
                                             }
                                         }
                                     }

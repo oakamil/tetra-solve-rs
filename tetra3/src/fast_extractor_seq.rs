@@ -128,7 +128,7 @@ impl FastExtractor {
                             }
                             count += self.out_width;
                         }
-                        let target = ((count + 1) / 2) as u32;
+                        let target = count.div_ceil(2) as u32;
                         let mut accum = 0;
                         let mut med = 0.0f32;
                         for (val, &c) in hist.iter().enumerate() {
@@ -139,39 +139,24 @@ impl FastExtractor {
                             }
                         }
 
-                        // OPTIMIZATION: Manually unrolled second pass accumulates residual sum-of-squares
-                        // while performing integer subtraction. Contiguous access allows SIMD.
-                        let mut sum_sq0 = 0.0;
-                        let mut sum_sq1 = 0.0;
-                        let mut sum_sq2 = 0.0;
-                        let mut sum_sq3 = 0.0;
-                        let mut o_chunks = self.image_i32.chunks_exact_mut(4);
-                        let mut i_chunks = self.downsampled_u32.chunks_exact(4);
-                        for (o, i) in o_chunks.by_ref().zip(i_chunks.by_ref()) {
-                            let v0 = (i[0] as f32) - med;
-                            let v1 = (i[1] as f32) - med;
-                            let v2 = (i[2] as f32) - med;
-                            let v3 = (i[3] as f32) - med;
-                            o[0] = (v0 * 128.0).round() as i32;
-                            o[1] = (v1 * 128.0).round() as i32;
-                            o[2] = (v2 * 128.0).round() as i32;
-                            o[3] = (v3 * 128.0).round() as i32;
-                            sum_sq0 += (v0 * v0) as f64;
-                            sum_sq1 += (v1 * v1) as f64;
-                            sum_sq2 += (v2 * v2) as f64;
-                            sum_sq3 += (v3 * v3) as f64;
+                        // OPTIMIZATION: Pure integer loop accumulates residual sum-of-squares
+                        // mathematically on the fly without inner loop floats.
+                        let med_i32 = (med * 128.0).round() as i32;
+                        let mut sum_i = 0u64;
+                        let mut sum_sq_i = 0u64;
+
+                        for (o, &i) in self.image_i32.iter_mut().zip(self.downsampled_u32.iter()) {
+                            let iv = i as u64;
+                            sum_i += iv;
+                            sum_sq_i += iv * iv;
+                            *o = (i as i32 * 128) - med_i32;
                         }
-                        let mut sum_sq = sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
-                        for (o, &i) in o_chunks
-                            .into_remainder()
-                            .iter_mut()
-                            .zip(i_chunks.remainder().iter())
-                        {
-                            let val_f32 = (i as f32) - med;
-                            *o = (val_f32 * 128.0).round() as i32;
-                            sum_sq += (val_f32 * val_f32) as f64;
-                        }
-                        sum_sq
+
+                        let med_f64 = med as f64;
+                        let n_f64 = self.downsampled_u32.len() as f64;
+
+                        (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                            + n_f64 * med_f64 * med_f64
                     }
                     FastBgSubMode::LineMedian => {
                         let mut hist = [0u32; 4096];
@@ -205,10 +190,10 @@ impl FastExtractor {
                                         *hist.get_unchecked_mut(v as usize) += 1;
                                     }
                                 }
-                                count += rem_read as usize;
+                                count += rem_read;
                             }
 
-                            let target = ((count + 1) / 2) as u32;
+                            let target = count.div_ceil(2) as u32;
                             let mut accum = 0;
                             let mut med_val = 0u32;
                             for (val, &c) in hist.iter().enumerate() {
@@ -243,8 +228,8 @@ impl FastExtractor {
                         total_sum_sq
                     }
                     FastBgSubMode::BlockMedian { block_size } => {
-                        let grid_w = (self.out_width + block_size - 1) / block_size;
-                        let grid_h = (self.out_height + block_size - 1) / block_size;
+                        let grid_w = self.out_width.div_ceil(block_size);
+                        let grid_h = self.out_height.div_ceil(block_size);
                         let mut hists = vec![0u32; grid_w * 4096];
 
                         for gy in 0..grid_h {
@@ -275,7 +260,7 @@ impl FastExtractor {
                                 let end_x = (start_x + block_size).min(self.out_width);
                                 let num_rows = (start_y..end_y).step_by(4).count();
                                 let count = num_rows * (end_x - start_x);
-                                let target = ((count + 1) / 2) as u32;
+                                let target = count.div_ceil(2) as u32;
                                 let mut accum = 0;
                                 for (val, &c) in hist.iter().enumerate() {
                                     accum += c;
@@ -316,17 +301,17 @@ impl FastExtractor {
                                 for gx in 0..active_grid_w.saturating_sub(1) {
                                     d_grid_row[gx] = v_grid_row[gx + 1] - v_grid_row[gx];
                                 }
-                                let mut sum_sq0 = 0.0;
-                                let mut sum_sq1 = 0.0;
-                                let mut sum_sq2 = 0.0;
-                                let mut sum_sq3 = 0.0;
+                                let mut sum_sq0_int = 0i64;
+                                let mut sum_sq1_int = 0i64;
+                                let mut sum_sq2_int = 0i64;
+                                let mut sum_sq3_int = 0i64;
 
                                 let mut out_chunks = out_row.chunks_exact_mut(4);
                                 let mut src_chunks = src_row.chunks_exact(4);
                                 let mut gx0_chunks = bg_gx0.chunks_exact(4);
                                 let mut tx_chunks = bg_tx.chunks_exact(4);
 
-                                // OPTIMIZATION: Piecewise Constant Interpolation.
+                                // OPTIMIZATION: Piecewise Constant Interpolation using pure integer math.
                                 // Instead of interpolating the exact background for all 4 pixels, we evaluate it once
                                 // and apply it to the whole chunk. This eliminates 75% of LUT accesses and math.
                                 // Manually unrolled loop with multiple independent accumulators
@@ -341,41 +326,48 @@ impl FastExtractor {
                                         let gx_val = *gx.get_unchecked(0);
                                         let tx_val = *tx.get_unchecked(0);
                                         let bg = v_grid_row[gx_val] + tx_val * d_grid_row[gx_val];
+                                        let bg_i32 = (bg * 128.0).round() as i32;
 
-                                        let v0 = (*s.get_unchecked(0) as f32) - bg;
-                                        let v1 = (*s.get_unchecked(1) as f32) - bg;
-                                        let v2 = (*s.get_unchecked(2) as f32) - bg;
-                                        let v3 = (*s.get_unchecked(3) as f32) - bg;
+                                        let val0 = (*s.get_unchecked(0) as i32 * 128) - bg_i32;
+                                        let val1 = (*s.get_unchecked(1) as i32 * 128) - bg_i32;
+                                        let val2 = (*s.get_unchecked(2) as i32 * 128) - bg_i32;
+                                        let val3 = (*s.get_unchecked(3) as i32 * 128) - bg_i32;
 
-                                        *o.get_unchecked_mut(0) = (v0 * 128.0).round() as i32;
-                                        *o.get_unchecked_mut(1) = (v1 * 128.0).round() as i32;
-                                        *o.get_unchecked_mut(2) = (v2 * 128.0).round() as i32;
-                                        *o.get_unchecked_mut(3) = (v3 * 128.0).round() as i32;
+                                        *o.get_unchecked_mut(0) = val0;
+                                        *o.get_unchecked_mut(1) = val1;
+                                        *o.get_unchecked_mut(2) = val2;
+                                        *o.get_unchecked_mut(3) = val3;
 
-                                        sum_sq0 += (v0 * v0) as f64;
-                                        sum_sq1 += (v1 * v1) as f64;
-                                        sum_sq2 += (v2 * v2) as f64;
-                                        sum_sq3 += (v3 * v3) as f64;
+                                        sum_sq0_int += val0 as i64 * val0 as i64;
+                                        sum_sq1_int += val1 as i64 * val1 as i64;
+                                        sum_sq2_int += val2 as i64 * val2 as i64;
+                                        sum_sq3_int += val3 as i64 * val3 as i64;
                                     }
                                 }
 
-                                row_sq_sum += sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
+                                row_sq_sum +=
+                                    (sum_sq0_int + sum_sq1_int + sum_sq2_int + sum_sq3_int) as f64
+                                        / 16384.0;
 
                                 let x = out_chunks.into_remainder().len();
                                 if x > 0 {
                                     let rem_x = self.out_width - x;
+                                    let mut rem_sq_int = 0i64;
                                     for i in 0..x {
                                         unsafe {
                                             let gx0 = *bg_gx0.get_unchecked(rem_x + i);
                                             let tx = *bg_tx.get_unchecked(rem_x + i);
                                             let bg_val = v_grid_row[gx0] + tx * d_grid_row[gx0];
-                                            let val_f32 =
-                                                (*src_row.get_unchecked(rem_x + i) as f32) - bg_val;
-                                            *out_row.get_unchecked_mut(rem_x + i) =
-                                                (val_f32 * 128.0).round() as i32;
-                                            row_sq_sum += (val_f32 * val_f32) as f64;
+                                            let bg_i32 = (bg_val * 128.0).round() as i32;
+
+                                            let val = (*src_row.get_unchecked(rem_x + i) as i32
+                                                * 128)
+                                                - bg_i32;
+                                            *out_row.get_unchecked_mut(rem_x + i) = val;
+                                            rem_sq_int += val as i64 * val as i64;
                                         }
                                     }
+                                    row_sq_sum += rem_sq_int as f64 / 16384.0;
                                 }
                                 row_sq_sum
                             })
@@ -466,7 +458,7 @@ impl FastExtractor {
                             }
                             count += self.width;
                         }
-                        let target = ((count + 1) / 2) as u32;
+                        let target = count.div_ceil(2) as u32;
                         let mut accum = 0;
                         let mut med = 0.0f32;
                         for (val, &c) in hist.iter().enumerate() {
@@ -477,39 +469,24 @@ impl FastExtractor {
                             }
                         }
 
-                        // OPTIMIZATION: Manually unrolled second pass accumulates residual sum-of-squares
-                        // while performing integer subtraction. Contiguous access allows SIMD.
-                        let mut sum_sq0 = 0.0;
-                        let mut sum_sq1 = 0.0;
-                        let mut sum_sq2 = 0.0;
-                        let mut sum_sq3 = 0.0;
-                        let mut o_chunks = self.image_i16.chunks_exact_mut(4);
-                        let mut i_chunks = src_slice.chunks_exact(4);
-                        for (o, i) in o_chunks.by_ref().zip(i_chunks.by_ref()) {
-                            let v0 = (i[0] as f32) - med;
-                            let v1 = (i[1] as f32) - med;
-                            let v2 = (i[2] as f32) - med;
-                            let v3 = (i[3] as f32) - med;
-                            o[0] = (v0 * 128.0).round() as i16;
-                            o[1] = (v1 * 128.0).round() as i16;
-                            o[2] = (v2 * 128.0).round() as i16;
-                            o[3] = (v3 * 128.0).round() as i16;
-                            sum_sq0 += (v0 * v0) as f64;
-                            sum_sq1 += (v1 * v1) as f64;
-                            sum_sq2 += (v2 * v2) as f64;
-                            sum_sq3 += (v3 * v3) as f64;
+                        // OPTIMIZATION: Pure integer loop accumulates residual sum-of-squares
+                        // mathematically on the fly without inner loop floats.
+                        let med_i32 = (med * 128.0).round() as i32;
+                        let mut sum_i = 0u64;
+                        let mut sum_sq_i = 0u64;
+
+                        for (o, &i) in self.image_i16.iter_mut().zip(src_slice.iter()) {
+                            let iv = i as u64;
+                            sum_i += iv;
+                            sum_sq_i += iv * iv;
+                            *o = (i as i32 * 128 - med_i32) as i16;
                         }
-                        let mut sum_sq = sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
-                        for (o, &i) in o_chunks
-                            .into_remainder()
-                            .iter_mut()
-                            .zip(i_chunks.remainder().iter())
-                        {
-                            let val_f32 = (i as f32) - med;
-                            *o = (val_f32 * 128.0).round() as i16;
-                            sum_sq += (val_f32 * val_f32) as f64;
-                        }
-                        sum_sq
+
+                        let med_f64 = med as f64;
+                        let n_f64 = src_slice.len() as f64;
+
+                        (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                            + n_f64 * med_f64 * med_f64
                     }
                     FastBgSubMode::LineMedian => {
                         let mut hist = [0u32; 256];
@@ -543,10 +520,10 @@ impl FastExtractor {
                                         *hist.get_unchecked_mut(v as usize) += 1;
                                     }
                                 }
-                                count += rem_read as usize;
+                                count += rem_read;
                             }
 
-                            let target = ((count + 1) / 2) as u32;
+                            let target = count.div_ceil(2) as u32;
                             let mut accum = 0;
                             let mut med_val = 0u32;
                             for (val, &c) in hist.iter().enumerate() {
@@ -577,8 +554,8 @@ impl FastExtractor {
                         total_sum_sq
                     }
                     FastBgSubMode::BlockMedian { block_size } => {
-                        let grid_w = (self.width + block_size - 1) / block_size;
-                        let grid_h = (self.height + block_size - 1) / block_size;
+                        let grid_w = self.width.div_ceil(block_size);
+                        let grid_h = self.height.div_ceil(block_size);
                         let mut hists = vec![0u32; grid_w * 256];
                         for gy in 0..grid_h {
                             hists.fill(0);
@@ -607,7 +584,7 @@ impl FastExtractor {
                                 let end_x = (start_x + block_size).min(self.width);
                                 let num_rows = (start_y..end_y).step_by(4).count();
                                 let count = num_rows * (end_x - start_x);
-                                let target = ((count + 1) / 2) as u32;
+                                let target = count.div_ceil(2) as u32;
                                 let mut accum = 0;
                                 for (val, &c) in hist.iter().enumerate() {
                                     accum += c;
@@ -647,20 +624,20 @@ impl FastExtractor {
                                 for gx in 0..active_grid_w.saturating_sub(1) {
                                     d_grid_row[gx] = v_grid_row[gx + 1] - v_grid_row[gx];
                                 }
-                                let mut sum_sq0 = 0.0;
-                                let mut sum_sq1 = 0.0;
-                                let mut sum_sq2 = 0.0;
-                                let mut sum_sq3 = 0.0;
+                                let mut sum_sq0_int = 0i64;
+                                let mut sum_sq1_int = 0i64;
+                                let mut sum_sq2_int = 0i64;
+                                let mut sum_sq3_int = 0i64;
 
                                 let mut out_chunks = out_row.chunks_exact_mut(4);
                                 let mut src_chunks = src_row.chunks_exact(4);
                                 let mut gx0_chunks = bg_gx0.chunks_exact(4);
                                 let mut tx_chunks = bg_tx.chunks_exact(4);
 
-                                // OPTIMIZATION: Piecewise Constant Interpolation.
+                                // OPTIMIZATION: Piecewise Constant Interpolation using pure integer math.
                                 // Instead of interpolating the exact background for all 4 pixels, we evaluate it once
                                 // and apply it to the whole chunk. This eliminates 75% of LUT accesses and math.
-                                // Manually unrolled loop with multiple independent accumulators
+                                // Manually unrolled loop with multiple independent integer accumulators
                                 // improves instruction-level parallelism.
                                 for (((o, s), gx), tx) in out_chunks
                                     .by_ref()
@@ -672,41 +649,48 @@ impl FastExtractor {
                                         let gx_val = *gx.get_unchecked(0);
                                         let tx_val = *tx.get_unchecked(0);
                                         let bg = v_grid_row[gx_val] + tx_val * d_grid_row[gx_val];
+                                        let bg_i32 = (bg * 128.0).round() as i32;
 
-                                        let v0 = (*s.get_unchecked(0) as f32) - bg;
-                                        let v1 = (*s.get_unchecked(1) as f32) - bg;
-                                        let v2 = (*s.get_unchecked(2) as f32) - bg;
-                                        let v3 = (*s.get_unchecked(3) as f32) - bg;
+                                        let val0 = (*s.get_unchecked(0) as i32 * 128) - bg_i32;
+                                        let val1 = (*s.get_unchecked(1) as i32 * 128) - bg_i32;
+                                        let val2 = (*s.get_unchecked(2) as i32 * 128) - bg_i32;
+                                        let val3 = (*s.get_unchecked(3) as i32 * 128) - bg_i32;
 
-                                        *o.get_unchecked_mut(0) = (v0 * 128.0).round() as i16;
-                                        *o.get_unchecked_mut(1) = (v1 * 128.0).round() as i16;
-                                        *o.get_unchecked_mut(2) = (v2 * 128.0).round() as i16;
-                                        *o.get_unchecked_mut(3) = (v3 * 128.0).round() as i16;
+                                        *o.get_unchecked_mut(0) = val0 as i16;
+                                        *o.get_unchecked_mut(1) = val1 as i16;
+                                        *o.get_unchecked_mut(2) = val2 as i16;
+                                        *o.get_unchecked_mut(3) = val3 as i16;
 
-                                        sum_sq0 += (v0 * v0) as f64;
-                                        sum_sq1 += (v1 * v1) as f64;
-                                        sum_sq2 += (v2 * v2) as f64;
-                                        sum_sq3 += (v3 * v3) as f64;
+                                        sum_sq0_int += val0 as i64 * val0 as i64;
+                                        sum_sq1_int += val1 as i64 * val1 as i64;
+                                        sum_sq2_int += val2 as i64 * val2 as i64;
+                                        sum_sq3_int += val3 as i64 * val3 as i64;
                                     }
                                 }
 
-                                row_sq_sum += sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
+                                row_sq_sum +=
+                                    (sum_sq0_int + sum_sq1_int + sum_sq2_int + sum_sq3_int) as f64
+                                        / 16384.0;
 
                                 let x = out_chunks.into_remainder().len();
                                 if x > 0 {
                                     let rem_x = self.width - x;
+                                    let mut rem_sq_int = 0i64;
                                     for i in 0..x {
                                         unsafe {
                                             let gx0 = *bg_gx0.get_unchecked(rem_x + i);
                                             let tx = *bg_tx.get_unchecked(rem_x + i);
                                             let bg_val = v_grid_row[gx0] + tx * d_grid_row[gx0];
-                                            let val_f32 =
-                                                (*src_row.get_unchecked(rem_x + i) as f32) - bg_val;
-                                            *out_row.get_unchecked_mut(rem_x + i) =
-                                                (val_f32 * 128.0).round() as i16;
-                                            row_sq_sum += (val_f32 * val_f32) as f64;
+                                            let bg_i32 = (bg_val * 128.0).round() as i32;
+
+                                            let val = (*src_row.get_unchecked(rem_x + i) as i32
+                                                * 128)
+                                                - bg_i32;
+                                            *out_row.get_unchecked_mut(rem_x + i) = val as i16;
+                                            rem_sq_int += val as i64 * val as i64;
                                         }
                                     }
+                                    row_sq_sum += rem_sq_int as f64 / 16384.0;
                                 }
                                 row_sq_sum
                             })
@@ -839,7 +823,7 @@ impl FastExtractor {
             }
             mask[seed] = false;
             let mut area = 1;
-            let val = img[seed].into() * (1.0 / 128.0);
+            let val = img[seed].into();
             let mut sum = val;
             let sx = (seed % width) as f64;
             let sy = (seed / width) as f64;
@@ -854,12 +838,14 @@ impl FastExtractor {
             while let Some(idx) = stack.pop() {
                 let cy = idx / width;
                 let cx = idx % width;
-                let mut check_push = |ni: usize, nx: f64, ny: f64| unsafe {
+                let mut check_push = |ni: usize, n_cx: usize, n_cy: usize| unsafe {
                     if *mask.get_unchecked(ni) {
                         *mask.get_unchecked_mut(ni) = false;
                         area += 1;
-                        let v = (*img.get_unchecked(ni)).into() * (1.0 / 128.0);
+                        let v = (*img.get_unchecked(ni)).into();
                         sum += v;
+                        let nx = n_cx as f64;
+                        let ny = n_cy as f64;
                         sum_x += nx * v;
                         sum_y += ny * v;
                         sum_xx += nx * nx * v;
@@ -869,20 +855,26 @@ impl FastExtractor {
                     }
                 };
                 if cy > 0 {
-                    check_push(idx - width, cx as f64, (cy - 1) as f64);
+                    check_push(idx - width, cx, cy - 1);
                 }
                 if cy + 1 < height {
-                    check_push(idx + width, cx as f64, (cy + 1) as f64);
+                    check_push(idx + width, cx, cy + 1);
                 }
                 if cx > 0 {
-                    check_push(idx - 1, (cx - 1) as f64, cy as f64);
+                    check_push(idx - 1, cx - 1, cy);
                 }
                 if cx + 1 < width {
-                    check_push(idx + 1, (cx + 1) as f64, cy as f64);
+                    check_push(idx + 1, cx + 1, cy);
                 }
             }
 
-            if area < min_a || area > max_a || sum < min_s || sum > max_s || sum == 0.0 {
+            let scaled_sum = sum * (1.0 / 128.0);
+            if area < min_a
+                || area > max_a
+                || scaled_sum < min_s
+                || scaled_sum > max_s
+                || scaled_sum == 0.0
+            {
                 continue;
             }
             let inv_sum = 1.0 / sum;
@@ -903,14 +895,14 @@ impl FastExtractor {
             extracted.push(FastCentroidResult {
                 y: m1_y + 0.5,
                 x: m1_x + 0.5,
-                sum,
+                sum: scaled_sum,
                 area,
                 axis_ratio,
             });
         }
 
         // 3. Sort
-        extracted.sort_by(|a, b| b.sum.partial_cmp(&a.sum).unwrap_or(Ordering::Equal));
+        extracted.sort_unstable_by(|a, b| b.sum.partial_cmp(&a.sum).unwrap_or(Ordering::Equal));
 
         // 4. Centroid window
         if let Some(mut window) = options.centroid_window {
@@ -931,7 +923,7 @@ impl FastExtractor {
                         let row_slice = img.get_unchecked(row_start..row_start + window);
                         let wy_f = *cw_wy.get_unchecked(wy);
                         for (wx, &v) in row_slice.iter().enumerate() {
-                            let val = v.into() * (1.0 / 128.0);
+                            let val = v.into();
                             img_sum += val;
                             sum_xc += val * *cw_wx.get_unchecked(wx);
                             sum_yc += val * wy_f;
