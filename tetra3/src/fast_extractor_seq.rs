@@ -7,13 +7,10 @@
 // The original underlying code is licensed under the Apache License, Version 2.0.
 // Original Copyright (c) European Space Agency, Steven Rosenthal, and contributors.
 //
-// This derivative work is licensed under the PolyForm Noncommercial License 1.0.0.
-// You may not use this file except in compliance with the PolyForm Noncommercial
+// This derivative work is licensed under the PolyForm Small Buisness License 1.0.0.
+// You may not use this file except in compliance with the PolyForm Small Business
 // License 1.0.0. A copy of the License is located in the LICENSE.md file in the
 // root of this repository.
-//
-// Commercial use of this software is strictly prohibited without a separate
-// commercial license.
 //
 impl FastExtractor {
     /// Sequential version of the extractor that trades some accuract for single-threaded performance.

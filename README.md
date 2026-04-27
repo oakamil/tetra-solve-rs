@@ -96,7 +96,7 @@ Benchmarks on the Raspberry Pi 5 with 4 GB RAM show ~15x improvement over the ex
 
 ## License
 
-This project is licensed under the PolyForm Noncommercial License 1.0.0.
+This project is licensed under the PolyForm Small Business License 1.0.0.
 
 See LICENSE.md for full details.
 
