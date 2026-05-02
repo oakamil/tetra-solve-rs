@@ -165,9 +165,9 @@ message Solution {
     repeated CatalogStarInfo catalog_stars = 23;
     
     // Added extraction time for combined calls
-    optional double extraction_time_ms = 24; 
-}
-
+    optional double extraction_time_ms = 24;
+    bool is_mirrored = 25;
+    }
 // --- RPC Endpoints ---
 
 message SolveRequest {

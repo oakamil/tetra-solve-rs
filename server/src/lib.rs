@@ -211,6 +211,7 @@ fn map_solution(sol: T3Solution, extraction_time_ms: Option<f64>) -> proto::Solu
         matched_cat_id,
         catalog_stars,
         extraction_time_ms,
+        is_mirrored: sol.is_mirrored,
     }
 }
 

@@ -270,3 +270,118 @@ fn test_solver_consistency_with_testdata() {
         );
     }
 }
+
+#[test]
+fn test_solver_mirrored_image() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    let zip_path = Path::new("tests/fixtures/solver_fixtures.zip");
+
+    if !db_path.exists() {
+        eprintln!("Skipping test: default_database.npz not found.");
+        return;
+    }
+
+    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+
+    let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
+    let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
+
+    // We'll just test on the first sample
+    let input_filename = "input_1.json";
+    let mut input_buffer = Vec::new();
+    {
+        let mut req_file = archive.by_name(input_filename).unwrap();
+        req_file.read_to_end(&mut input_buffer).unwrap();
+    }
+    let mut input_dto: SolveInputDto = serde_json::from_slice(&input_buffer).unwrap();
+
+    let output_filename = "output_1.json";
+    let mut output_buffer = Vec::new();
+    {
+        let mut res_file = archive.by_name(output_filename).unwrap();
+        res_file.read_to_end(&mut output_buffer).unwrap();
+    }
+    let expected_dto: SolutionDto = serde_json::from_slice(&output_buffer).unwrap();
+
+    // MIRROR the image centroids across the X axis
+    for c in &mut input_dto.centroids {
+        c[1] = input_dto.image_width - c[1];
+    }
+
+    // Set a target pixel exactly at one of the centroids to test back-projection
+    let test_pixel = input_dto.centroids[0];
+    input_dto.options.target_pixel = Some(vec![test_pixel]);
+
+    let mut flat_cents = Vec::with_capacity(input_dto.centroids.len() * 2);
+    for c in &input_dto.centroids {
+        flat_cents.push(c[0]);
+        flat_cents.push(c[1]);
+    }
+    let centroids_array =
+        Array2::from_shape_vec((input_dto.centroids.len(), 2), flat_cents).unwrap();
+
+    let target_pixel = input_dto.options.target_pixel.clone().map(|tp| {
+        let mut flat = Vec::with_capacity(tp.len() * 2);
+        for c in &tp {
+            flat.push(c[0]);
+            flat.push(c[1]);
+        }
+        Array2::from_shape_vec((tp.len(), 2), flat).unwrap()
+    });
+
+    let options = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        fov_max_error: input_dto.options.fov_max_error,
+        match_radius: input_dto.options.match_radius,
+        match_threshold: input_dto.options.match_threshold,
+        solve_timeout_ms: input_dto.options.solve_timeout_ms,
+        distortion: input_dto.options.distortion,
+        match_max_error: input_dto.options.match_max_error,
+        return_matches: input_dto.options.return_matches,
+        return_catalog: input_dto.options.return_catalog,
+        return_rotation_matrix: input_dto.options.return_rotation_matrix,
+        target_pixel,
+        target_sky_coord: None,
+    };
+
+    let result = solver.solve(
+        &centroids_array,
+        (input_dto.image_height, input_dto.image_width),
+        options,
+    );
+
+    assert_eq!(result.status, SolveStatus::MatchFound);
+    assert!(
+        result.is_mirrored,
+        "Solver should have detected the image was mirrored"
+    );
+
+    let epsilon = 1e-4;
+
+    // RA and Dec should exactly match the unmirrored original output
+    assert!(
+        (result.ra.unwrap() - expected_dto.ra.unwrap()).abs() < epsilon,
+        "RA does not match"
+    );
+    assert!(
+        (result.dec.unwrap() - expected_dto.dec.unwrap()).abs() < epsilon,
+        "Dec does not match"
+    );
+
+    // Roll should EXACTLY MATCH the original roll, because the physical pointing has not changed
+    let expected_roll = expected_dto.roll.unwrap().rem_euclid(360.0);
+    let mut roll_diff = (result.roll.unwrap() - expected_roll).abs();
+    if roll_diff > 180.0 {
+        roll_diff = 360.0 - roll_diff;
+    }
+    assert!(
+        roll_diff < epsilon,
+        "Roll does not match original roll: got {}, expected {}",
+        result.roll.unwrap(),
+        expected_roll
+    );
+
+    // The target pixel back-projection should work seamlessly
+    assert!(result.target_ra.is_some());
+    assert!(result.target_dec.is_some());
+}

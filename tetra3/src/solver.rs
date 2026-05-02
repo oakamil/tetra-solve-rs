@@ -146,6 +146,7 @@ pub struct Solution {
     pub epoch_proper_motion: Option<f64>,
     pub status: SolveStatus,
     pub t_solve_ms: f64,
+    pub is_mirrored: bool,
     pub rotation_matrix: Option<Array2<f64>>,
     pub target_ra: Option<Vec<f64>>,
     pub target_dec: Option<Vec<f64>>,
@@ -401,7 +402,7 @@ fn find_rotation_matrix_and_det_inplace(
     image_vectors: &[[f64; 3]],
     catalog_vectors: &[[f64; 3]],
     len: usize,
-) -> (Matrix3<f64>, f64) {
+) -> Option<(Matrix3<f64>, f64)> {
     let mut h = Matrix3::<f64>::zeros();
     // H = image_vectors.T * catalog_vectors
     for i in 0..len {
@@ -415,9 +416,9 @@ fn find_rotation_matrix_and_det_inplace(
     let svd = SVD::new(h, true, true);
     if let (Some(u), Some(vt)) = (svd.u, svd.v_t) {
         let rot = u * vt;
-        (rot, rot.determinant())
+        Some((rot, rot.determinant()))
     } else {
-        (Matrix3::zeros(), -1.0)
+        None
     }
 }
 
@@ -578,11 +579,11 @@ fn verify_and_build_solution(
     }
 
     let matched_img_vecs = compute_vectors_flat(&matched_img_cents, height, width, fov);
-    let (precise_rotation_matrix, _) = find_rotation_matrix_and_det_inplace(
+    let (precise_rotation_matrix, precise_det) = find_rotation_matrix_and_det_inplace(
         &matched_img_vecs,
         &matched_cat_vecs,
         num_star_matches,
-    );
+    )?;
 
     let mut k_final = options.distortion;
     if options.distortion.is_some() {
@@ -670,10 +671,15 @@ fn verify_and_build_solution(
                 .sqrt(),
         )
         .to_degrees();
-    let roll = precise_rotation_matrix[(1, 2)]
+    let mut roll = precise_rotation_matrix[(1, 2)]
         .atan2(precise_rotation_matrix[(2, 2)])
-        .to_degrees()
-        .rem_euclid(360.0);
+        .to_degrees();
+    if precise_det < 0.0 {
+        // Assume horizontal mirroring (X-axis flipped).
+        // By negating the extracted roll, we recover the true physical spacecraft roll.
+        roll = -roll;
+    }
+    let roll = roll.rem_euclid(360.0);
 
     let mut precise_rot_arr2 = Array2::zeros((3, 3));
     for r in 0..3 {
@@ -697,6 +703,7 @@ fn verify_and_build_solution(
         epoch_proper_motion: db_props.get("epoch_proper_motion").cloned(),
         status: SolveStatus::MatchFound,
         t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+        is_mirrored: precise_det < 0.0,
         ..Default::default()
     };
 
@@ -1730,14 +1737,15 @@ impl Solver {
                                     );
                                 };
 
-                                let (rotation_matrix, det) = find_rotation_matrix_and_det_inplace(
-                                    &scratch.sp_image_pattern_vectors_sorted,
-                                    &scratch.sp_catalog_pattern_vectors_sorted,
-                                    4,
-                                );
-                                if det < 0.0 {
-                                    continue;
-                                }
+                                let (rotation_matrix, _det) =
+                                    match find_rotation_matrix_and_det_inplace(
+                                        &scratch.sp_image_pattern_vectors_sorted,
+                                        &scratch.sp_catalog_pattern_vectors_sorted,
+                                        4,
+                                    ) {
+                                        Some(res) => res,
+                                        None => continue,
+                                    };
 
                                 if let Some(solution) = verify_and_build_solution(
                                     scratch,

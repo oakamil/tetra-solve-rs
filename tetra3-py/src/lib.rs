@@ -156,6 +156,7 @@ impl PyTetra3 {
         out_dict.set_item("rmse", solution.rmse)?;
         out_dict.set_item("prob", solution.prob)?;
         out_dict.set_item("matches", solution.matches)?;
+        out_dict.set_item("is_mirrored", solution.is_mirrored)?;
 
         out_dict.set_item("t_extract_ms", 0.0)?; // Explicitly 0 since no extraction occurred
         out_dict.set_item("t_solve_ms", solution.t_solve_ms)?;
@@ -203,6 +204,7 @@ impl PyTetra3 {
         out_dict.set_item("rmse", solution.rmse)?;
         out_dict.set_item("prob", solution.prob)?;
         out_dict.set_item("matches", solution.matches)?;
+        out_dict.set_item("is_mirrored", solution.is_mirrored)?;
 
         out_dict.set_item("t_extract_ms", ext_time)?;
         out_dict.set_item("t_solve_ms", solution.t_solve_ms)?;
