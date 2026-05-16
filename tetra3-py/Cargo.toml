@@ -10,5 +10,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Alias the core crate so it doesn't conflict with the Python module name
 tetra3_core = { path = "../tetra3", package = "tetra3" }
-pyo3 = { version = "0.28.2" }
+pyo3 = { version = "0.28.3" }
 numpy = "0.28"
