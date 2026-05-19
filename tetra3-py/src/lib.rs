@@ -76,10 +76,12 @@ use tetra3_core::Tetra3;
 use tetra3_core::extractor::{BgSubMode, ExtractOptions, SigmaMode};
 use tetra3_core::solver::SolveOptions;
 
+use std::sync::Mutex;
+
 /// Python wrapper for the highly optimized Tetra3 engine.
-#[pyclass(name = "Tetra3", unsendable)]
+#[pyclass(name = "Tetra3")]
 pub struct PyTetra3 {
-    inner: Tetra3,
+    inner: Mutex<Tetra3>,
 }
 
 #[pymethods]
@@ -90,7 +92,7 @@ impl PyTetra3 {
     #[new]
     fn new(database_path: String) -> Self {
         Self {
-            inner: Tetra3::new(PathBuf::from(database_path)),
+            inner: Mutex::new(Tetra3::new(PathBuf::from(database_path))),
         }
     }
 
@@ -107,7 +109,7 @@ impl PyTetra3 {
     ///     results. The keys are: `cropped_and_downsampled`, `removed_background`, `binary_mask`.
     #[pyo3(signature = (image, **kwargs))]
     fn get_centroids_from_image<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         image: PyReadonlyArray2<'py, f32>,
         kwargs: Option<&Bound<'py, PyDict>>,
@@ -130,7 +132,10 @@ impl PyTetra3 {
         let img_view = image.as_array();
 
         // 3. Run the native Rust extraction pipeline
-        let result = self.inner.get_centroids_from_image(&img_view, options);
+        let result = py.detach(|| {
+            let mut inner = self.inner.lock().unwrap();
+            inner.get_centroids_from_image(&img_view, options)
+        });
         let num_centroids = result.centroids.len();
 
         // 4. Build the core results (ndarray or tuple of ndarrays)
@@ -248,7 +253,7 @@ impl PyTetra3 {
     ///         - 'status': One of MATCH_FOUND, NO_MATCH, TIMEOUT, CANCELLED, TOO_FEW.
     #[pyo3(signature = (centroids, size, **kwargs))]
     fn solve_from_centroids<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         centroids: PyReadonlyArray2<'py, f64>,
         size: (f64, f64),
@@ -260,10 +265,14 @@ impl PyTetra3 {
         let cent_owned = centroids.as_array().to_owned();
 
         // Run the native Rust solve pipeline, skipping extraction
-        let solution = self
-            .inner
-            .solve_from_centroids(&cent_owned, size, solve_options)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let solution = py
+            .detach(|| {
+                let mut inner = self.inner.lock().unwrap();
+                inner
+                    .solve_from_centroids(&cent_owned, size, solve_options)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         let out_dict = PyDict::new(py);
 
@@ -335,7 +344,7 @@ impl PyTetra3 {
     /// Returns a dictionary containing the solution and execution times.
     #[pyo3(signature = (image, **kwargs))]
     fn solve_from_image<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         image: PyReadonlyArray2<'py, f32>,
         kwargs: Option<&Bound<'py, PyDict>>,
@@ -345,10 +354,14 @@ impl PyTetra3 {
 
         let img_view = image.as_array();
 
-        let (solution, ext_time) = self
-            .inner
-            .solve_from_image(&img_view, extract_options, solve_options)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let (solution, ext_time) = py
+            .detach(|| {
+                let mut inner = self.inner.lock().unwrap();
+                inner
+                    .solve_from_image(&img_view, extract_options, solve_options)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         let out_dict = PyDict::new(py);
 
