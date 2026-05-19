@@ -7,7 +7,7 @@ edition = "2024"
 zip = "0.6"
 ndarray = { version = "0.17.1", features = ["rayon"] }
 npyz = "0.8"
-kiddo = "3.0"
+kiddo = "4.2.0"
 nalgebra = "0.34.1"
 rayon = "1.11.0"
 
