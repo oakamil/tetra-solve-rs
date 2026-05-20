@@ -6,105 +6,109 @@ This package provides a zero-copy, natively compiled Python interface to the Rus
 
 ## Prerequisites
 
-To compile the bindings from source, you will need:
-* **Rust:** (Install via [rustup](https://rustup.rs/))
-* **Python:** 3.8 or newer
-* **Maturin:** The build system for PyO3 (`pip install maturin`)
+- A working Rust toolchain (install via [rustup](https://rustup.rs/))
+- Python 3.8+
+- `maturin` for building the Python wheel (`pip install maturin`)
 
-## Installation & Development
+## Building & Installation
 
-It is highly recommended to build and install this package inside a Python virtual environment.
-
-**⚠️ Important Build Note:** You *must* pass `--features pyo3/extension-module` when building with Maturin. This feature is strictly opt-in to prevent the Python C-API linker from breaking standard `cargo test` runs in the broader Rust workspace, but it is required for Python to recognize the compiled `.so` file as an importable module.
-
-### 1. Local Development (Testing)
-To compile the library and immediately install it into your active virtual environment, run:
-```bash
-maturin develop --release --features pyo3/extension-module
-```
-
-*Note: Always use `--release` when benchmarking or plate solving. Unoptimized debug builds are significantly slower.*
-
-### 2. Building a Wheel for Distribution
-
-To create a standalone Python package (`.whl` file) that you can distribute to other machines with the same OS/Architecture:
+To build the wheel for your current environment, run:
 
 ```bash
-maturin build --release --features pyo3/extension-module
+maturin build --release
 ```
 
-The compiled wheel will be placed in `target/wheels/`. You can then install it on target machines using standard pip:
+The compiled `.whl` file will be placed in the `target/wheels/` directory, which you can then install using `pip`:
 
 ```bash
-pip install target/wheels/tetra3-*.whl
+pip install target/wheels/tetra3_py-*.whl
 ```
 
-## Quick Start
-
-The API is designed to feel native to Python scientific computing pipelines. The engine expects a 2D float32 NumPy array.
-
-```python
-import numpy as np
-from PIL import Image
-import tetra3
-
-# 1. Initialize the Tetra3 Engine
-# The database is lazy-loaded and won't hit the disk until the first solve
-t3 = tetra3.Tetra3("/path/to/default_database.npz")
-
-# 2. Load an image as an 8-bit grayscale and convert to a float32 NumPy array
-img = Image.open("night_sky.jpg").convert('L')
-img_arr = np.asarray(img, dtype=np.float32)
-
-# 3. Solve! (Zero-copy ingestion)
-result = t3.solve_from_image(
-    img_arr, 
-    fov_estimate=11.4, 
-    downsample=2,
-    return_images=True # Passes debug images back to Python zero-copy!
-)
-
-# Print results
-if result.get("ra") is not None:
-    print("Match Found!")
-    print(f"RA:  {result['ra']:.4f}")
-    print(f"Dec: {result['dec']:.4f}")
-    print(f"Solve Time: {result['t_solve_ms']:.2f} ms")
-else:
-    print("No match found.")
-```
+---
 
 ## API Reference
 
-### `Tetra3(database_path: str)`
+### `Tetra3(database_path)`
+Creates a new Tetra3 instance. The underlying star database is lazy-loaded, meaning it won't hit the disk until the first plate-solving operation is executed.
 
-Creates a new Tetra3 solver instance.
+* **`database_path`** *(str)*: Path to the `.npz` catalog database.
 
-### `get_centroids_from_image(image: np.ndarray, **kwargs) -> dict`
+---
 
-Extracts stars from the image.
+### `get_centroids_from_image(image, **kwargs)`
+Extracts star centroids from a 2D NumPy array using zero-copy memory access.
 
-* **Arguments:** * `image`: A 2D float32 NumPy array.
-* `**kwargs`: Supports `sigma`, `downsample`, `min_area`, `max_area`, `min_sum`, `max_sum`, `max_axis_ratio`, `bg_sub_mode` (string), `sigma_mode` (string), `return_images` (bool), and `return_moments` (bool).
+**Arguments:**
+* **`image`** *(numpy.ndarray)*: A 2D array of `float32` representing the image.
+* **`**kwargs`**: Extraction options:
+  * `sigma` *(float)*
+  * `image_th` *(float)*
+  * `downsample` *(int)*
+  * `filtsize` *(int)*
+  * `binary_open` *(bool)*
+  * `centroid_window` *(int)*
+  * `min_area` / `max_area` *(int)*
+  * `min_sum` / `max_sum` *(float)*
+  * `max_axis_ratio` *(float)*
+  * `max_returned` *(int)*
+  * `bg_sub_mode` *(str)*: `"local_median"`, `"local_mean"`, `"global_median"`, `"global_mean"`, or `"none"`
+  * `sigma_mode` *(str)*: `"local_median_abs"`, `"local_root_square"`, `"global_median_abs"`, or `"global_root_square"`
+  * `return_moments` *(bool)*: If `True`, returns geometric moment data.
+  * `return_images` *(bool)*: If `True`, returns intermediate debug image arrays.
 
+**Returns:**
+* **Default (`return_moments=False`, `return_images=False`)**: A `numpy.ndarray` of shape `(N, 2)` containing `[y, x]` coordinates of the found centroids.
+* **With `return_moments=True`**: A tuple of arrays: `(centroids, sums, areas, moments, ratios)` where `moments` is an `(N, 3)` array of xx, yy, and xy second moments.
+* **With `return_images=True`**: A tuple containing `(core_results, dict_of_images)`. 
+  * `core_results` is the standard data payload that would have been returned if `return_images` was `False` (i.e., either the simple `(N, 2)` numpy array of centroids, or the full tuple of moment arrays if `return_moments=True`). 
+  * `dict_of_images` is a dictionary containing the keys `"cropped_and_downsampled"`, `"removed_background"`, and `"binary_mask"`.
 
-* **Returns:** A dictionary containing:
-* `'centroids'`: A single N x 4 NumPy array `[y, x, sum, area]`. If `return_moments=True` is passed, this expands to an N x 8 array including `[..., m2_xx, m2_yy, m2_xy, axis_ratio]`.
-* `'image_bg_subtracted'` / `'image_thresholded'`: Zero-copy NumPy arrays if `return_images=True` was passed.
+---
 
+### `solve_from_centroids(centroids, size, **kwargs)`
+Runs plate solving from pre-extracted centroids.
 
+**Arguments:**
+* **`centroids`** *(numpy.ndarray)*: A 2D array of `float64` representing the `[y, x]` centroid positions.
+* **`size`** *(tuple)*: A tuple of `(height, width)` as floats, representing the original image dimensions.
+* **`**kwargs`**: Solver configuration options:
+  * `fov_estimate` *(float)*
+  * `fov_max_error` *(float)*
+  * `match_radius` *(float)*
+  * `match_threshold` *(float)*
+  * `solve_timeout` *(int)*: Maximum time in ms.
+  * `distortion` *(float)*
+  * `match_max_error` *(float)*
+  * `return_matches` *(bool)*
+  * `return_catalog` *(bool)*
+  * `return_rotation_matrix` *(bool)*
+  * `target_pixel` *(numpy.ndarray)*: A 2D array representing specific `[y, x]` target coordinates to solve for.
+  * `target_sky_coord` *(numpy.ndarray)*: A 2D array representing specific `[RA, Dec]` targets.
 
-### `solve_from_image(image: np.ndarray, **kwargs) -> dict`
+**Returns:**
+* **`dict`**: A dictionary containing the solution. Key outputs include:
+  * `'RA'`, `'Dec'`, `'Roll'`, `'FOV'`, `'distortion'`
+  * `'RMSE'`, `'P90E'`, `'MAXE'`, `'Matches'`, `'Prob'`, `'is_mirrored'`
+  * `'epoch_equinox'`, `'epoch_proper_motion'`
+  * `'T_solve'` *(Execution time in ms)*
+  * `'status'` *(String representing the match state: e.g., 'MATCH_FOUND', 'NO_MATCH')*
+  * Target mapping outputs (if requested): `'RA_target'`, `'Dec_target'`, `'y_target'`, `'x_target'`
+  * Star outputs (if requested): `'matched_centroids'`, `'matched_stars'`, `'matched_catID'`, `'catalog_stars'`, `'rotation_matrix'`
 
-Runs the complete extraction and plate solving pipeline.
+---
 
-* **Arguments:**
-* `image`: A 2D float32 NumPy array.
-* `**kwargs`: Accepts all extraction arguments above, plus solver constraints like `fov_estimate`, `match_radius`, `verify_min_matches`, etc.
+### `solve_from_image(image, **kwargs)`
+Runs both extraction and plate solving in one uninterrupted, native pipeline.
 
+**Arguments:**
+* **`image`** *(numpy.ndarray)*: A 2D array of `float32`.
+* **`**kwargs`**: Accepts combined configuration keys for both extraction and solving operations (as detailed in the functions above).
 
-* **Returns:** A dictionary containing the solution: `'ra'`, `'dec'`, `'roll'`, `'fov'`, `'t_extract_ms'`, `'t_solve_ms'`, and optionally `'rotation_matrix'`. Also returns debug images if `return_images=True` was passed.
+**Returns:**
+* **`dict`**: The exact same solution dictionary as `solve_from_centroids`, with the addition of the `'T_extract'` key tracking extraction time in milliseconds.
 
 ---
 
 *Copyright (c) 2026 Omair Kamil. See the root LICENSE file for terms.*
+
+```
